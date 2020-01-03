@@ -1216,10 +1216,11 @@ static uint32_t lwlibav_vfr2cfr
         if( target_ts == current_ts )
             return vdhp->last_ts_frame_number;
     }
+    uint32_t composition_frame_number = vdhp->last_ts_frame_number;
+    double   prev_ts = current_ts;
     if( target_ts < current_ts )
     {
-        uint32_t composition_frame_number;
-        for( composition_frame_number = vdhp->last_ts_frame_number - 1;
+        for( composition_frame_number--;
              composition_frame_number;
              composition_frame_number-- )
         {
@@ -1227,38 +1228,57 @@ static uint32_t lwlibav_vfr2cfr
             if( ts != AV_NOPTS_VALUE )
             {
                 current_ts = ((double)(ts - vdhp->min_ts) * time_base.num) / time_base.den;
+                prev_ts = current_ts;
                 if( current_ts <= target_ts )
-                {
-                    frame_number = composition_frame_number;
                     break;
-                }
             }
         }
         if( composition_frame_number == 0 )
             return 0;
     }
-    else
+    double next_target_ts = (double)((uint64_t)frame_number * vohp->cfr_den) / vohp->cfr_num;
+    for( composition_frame_number++;
+         composition_frame_number <= vdhp->frame_count;
+         composition_frame_number++ )
     {
-        uint32_t composition_frame_number;
-        for( composition_frame_number = vdhp->last_ts_frame_number + 1;
-             composition_frame_number <= vdhp->frame_count;
-             composition_frame_number++ )
+        ts = lwlibav_get_ts( vdhp, composition_frame_number );
+        if( ts != AV_NOPTS_VALUE )
         {
-            ts = lwlibav_get_ts( vdhp, composition_frame_number );
-            if( ts != AV_NOPTS_VALUE )
+            current_ts = ((double)(ts - vdhp->min_ts) * time_base.num) / time_base.den;
+            if( current_ts >= target_ts )
             {
-                current_ts = ((double)(ts - vdhp->min_ts) * time_base.num) / time_base.den;
-                if( current_ts > target_ts )
+                uint32_t prev_composition_frame_number = composition_frame_number;
+                while( lwlibav_get_ts( vdhp, --prev_composition_frame_number ) == AV_NOPTS_VALUE );
+                if( prev_composition_frame_number == 0 )
+                    frame_number = 1;
+                else
                 {
-                    while( lwlibav_get_ts( vdhp, --composition_frame_number ) == AV_NOPTS_VALUE );
-                    frame_number = composition_frame_number ? composition_frame_number : 1;
-                    break;
+                    if( current_ts > next_target_ts )
+                        /* Between the current target and the next target, there are no input frames.
+                         * Therefore, output the previous frame. This is absolutely correct. */
+                        frame_number = prev_composition_frame_number;
+                    else
+                    {
+                        if( current_ts > (next_target_ts + target_ts) / 2 )
+                            /* The current frame is far from the current target and should be a candidate for the next target. */
+                            frame_number = prev_composition_frame_number;
+                        else
+                        {
+                            /* Choose the nearest one. */
+                            if( current_ts - target_ts >= target_ts - prev_ts )
+                                frame_number = prev_composition_frame_number;
+                            else
+                                frame_number = composition_frame_number;
+                        }
+                    }
                 }
+                break;
             }
+            prev_ts = current_ts;
         }
-        if( composition_frame_number > vdhp->frame_count )
-            frame_number = vdhp->frame_count;
     }
+    if( composition_frame_number > vdhp->frame_count )
+        frame_number = vdhp->frame_count;
     vdhp->last_ts_frame_number = frame_number;
     return frame_number;
 }
