@@ -8,6 +8,18 @@
 #include <VSHelper.h>
 
 
+enum ChromaPlacement {
+    MPEG1,
+    MPEG2,
+};
+
+
+enum ChromaWarping {
+    WarpAlongLuma,
+    WarpAlongChroma,
+};
+
+
 #if defined(AWARPSHARP2_X86)
 extern void sobel_u8_sse2(const uint8_t *srcp, uint8_t *dstp, int stride, int width, int height, int thresh, int bits_per_sample);
 extern void blur_r6_u8_sse2(uint8_t *mask, uint8_t *temp, int stride, int width, int height);
@@ -346,22 +358,40 @@ static void blur_r2_c(uint8_t *mask8, uint8_t *temp8, int stride, int width, int
 
 
 template <typename PixelType>
-static void bilinear_downscale_h_c(uint8_t *srcp8, int src_stride, int src_width, int src_height) {
+static void bilinear_downscale_h_c(uint8_t *srcp8, int src_stride, int src_width, int src_height, ChromaPlacement cplace) {
     PixelType *srcp = (PixelType *)srcp8;
 
     src_stride /= sizeof(PixelType);
 
-    for (int y = 0; y < src_height; y++) {
-        for (int x = 0; x < src_width / 2; x++)
-            srcp[x] = (srcp[x * 2] + srcp[x * 2 + 1] + 1) >> 1;
+    if (cplace == MPEG1) {
+        for (int y = 0; y < src_height; y++) {
+            for (int x = 0; x < src_width / 2; x++)
+                srcp[x] = (srcp[x * 2] + srcp[x * 2 + 1] + 1) >> 1;
 
-        srcp += src_stride;
+            srcp += src_stride;
+        }
+    } else if (cplace == MPEG2) {
+        for (int y = 0; y < src_height; y++) {
+            int c2 = srcp[0];
+
+            for (int x = 0; x < src_width / 2; x++) {
+                const int c0 = c2;
+                const int c1 = srcp[x * 2];
+                c2 = srcp[x * 2 + 1];
+
+                srcp[x] = (c0 + 2 * c1 + c2 + 2) >> 2;
+            }
+
+            srcp += src_stride;
+        }
     }
 }
 
 
 template <typename PixelType>
-static void bilinear_downscale_v_c(uint8_t *srcp8, int src_stride, int src_width, int src_height) {
+static void bilinear_downscale_v_c(uint8_t *srcp8, int src_stride, int src_width, int src_height, ChromaPlacement cplace) {
+    (void)cplace;
+
     PixelType *srcp = (PixelType *)srcp8;
 
     src_stride /= sizeof(PixelType);
@@ -376,19 +406,35 @@ static void bilinear_downscale_v_c(uint8_t *srcp8, int src_stride, int src_width
 
 
 template <typename PixelType>
-static void bilinear_downscale_hv_c(uint8_t *srcp8, int src_stride, int src_width, int src_height) {
+static void bilinear_downscale_hv_c(uint8_t *srcp8, int src_stride, int src_width, int src_height, ChromaPlacement cplace) {
     PixelType *srcp = (PixelType *)srcp8;
 
     src_stride /= sizeof(PixelType);
 
-    for (int y = 0; y < src_height / 2; y++) {
-        for (int x = 0; x < src_width / 2; x++) {
-            int avg1 = (srcp[x * 2 + y * src_stride] + srcp[x * 2 + 1 + y * src_stride] + 1) >> 1;
-            int avg2 = (srcp[x * 2 + (y + 1) * src_stride] + srcp[x * 2 + 1 + (y + 1) * src_stride] + 1) >> 1;
-            srcp[x] = (avg1 + avg2 + 1) >> 1;
-        }
+    if (cplace == MPEG1) {
+        for (int y = 0; y < src_height / 2; y++) {
+            for (int x = 0; x < src_width / 2; x++) {
+                int avg1 = (srcp[x * 2 + y * src_stride] + srcp[x * 2 + 1 + y * src_stride] + 1) >> 1;
+                int avg2 = (srcp[x * 2 + (y + 1) * src_stride] + srcp[x * 2 + 1 + (y + 1) * src_stride] + 1) >> 1;
+                srcp[x] = (avg1 + avg2 + 1) >> 1;
+            }
 
-        srcp += src_stride;
+            srcp += src_stride;
+        }
+    } else if (cplace == MPEG2) {
+        for (int y = 0; y < src_height / 2; y++) {
+            int c2 = srcp[y * src_stride] + srcp[(y + 1) * src_stride];
+
+            for (int x = 0; x < src_width / 2; x++) {
+                const int c0 = c2;
+                const int c1 = srcp[x * 2 + y * src_stride] + srcp[x * 2 + (y + 1) * src_stride];
+                c2 = srcp[x * 2 + 1 + y * src_stride] + srcp[x * 2 + 1 + (y + 1) * src_stride];
+
+                srcp[x] = (c0 + 2 * c1 + c2 + 4) >> 3;
+            }
+
+            srcp += src_stride;
+        }
     }
 }
 
@@ -533,25 +579,32 @@ typedef struct AwarpSharp2Data {
     int thresh;
     int blur_level;
     int blur_type;
-    int depth;
+    int depth[3];
     int chroma;
     int process[3];
+    ChromaPlacement cplace;
     int opt;
 
     void (*edge_mask)(const uint8_t *srcp, uint8_t *dstp, int stride, int width, int height, int thresh, int bits_per_sample);
     void (*blur)(uint8_t *mask, uint8_t *temp, int stride, int width, int height);
-    void (*bilinear_downscale)(uint8_t *srcp, int src_stride, int src_width, int src_height);
+    void (*bilinear_downscale)(uint8_t *srcp, int src_stride, int src_width, int src_height, ChromaPlacement cplace);
     void (*warp)(const uint8_t *srcp, const uint8_t *edgep, uint8_t *dstp, int src_stride, int edge_stride, int dst_stride, int width, int height, int depth, int bits_per_sample);
 } AWarpSharp2Data;
 
 
 static void VS_CC aWarpSharp2Init(VSMap *in, VSMap *out, void **instanceData, VSNode *node, VSCore *core, const VSAPI *vsapi) {
+    (void)in;
+    (void)out;
+    (void)core;
+
     AWarpSharp2Data *d = (AWarpSharp2Data *) * instanceData;
     vsapi->setVideoInfo(d->vi, 1, node);
 }
 
 
 static const VSFrameRef *VS_CC aWarpSharp2GetFrame(int n, int activationReason, void **instanceData, void **frameData, VSFrameContext *frameCtx, VSCore *core, const VSAPI *vsapi) {
+    (void)frameData;
+
     const AWarpSharp2Data *d = (const AWarpSharp2Data *) * instanceData;
 
     if (activationReason == arInitial) {
@@ -573,7 +626,7 @@ static const VSFrameRef *VS_CC aWarpSharp2GetFrame(int n, int activationReason, 
 
         uint8_t *mask_y = nullptr;
 
-        if (d->process[0] || ((d->process[1] || d->process[2]) && d->chroma == 0 && fmt->numPlanes > 1)) {
+        if (d->process[0] || ((d->process[1] || d->process[2]) && d->chroma == WarpAlongLuma && fmt->numPlanes > 1)) {
             int stride_y = vsapi->getStride(src, 0);
 
             mask_y = vs_aligned_malloc<uint8_t>(height_y * stride_y, 32);
@@ -587,13 +640,13 @@ static const VSFrameRef *VS_CC aWarpSharp2GetFrame(int n, int activationReason, 
                 d->blur(mask_y, dstp, stride_y, width_y, height_y);
 
             if (d->process[0])
-                d->warp(srcp, mask_y, dstp, stride_y, stride_y, stride_y, width_y, height_y, d->depth, d->vi->format->bitsPerSample);
+                d->warp(srcp, mask_y, dstp, stride_y, stride_y, stride_y, width_y, height_y, d->depth[0], d->vi->format->bitsPerSample);
             else
                 vs_bitblt(dstp, stride_y, srcp, stride_y, width_y * fmt->bytesPerSample, height_y);
         }
 
         if ((d->process[1] || d->process[2]) && fmt->numPlanes > 1) {
-            if (d->chroma == 1) {
+            if (d->chroma == WarpAlongChroma) {
                 int stride_uv = vsapi->getStride(src, 1);
                 int width_uv = vsapi->getFrameWidth(src, 1);
                 int height_uv = vsapi->getFrameHeight(src, 1);
@@ -612,18 +665,18 @@ static const VSFrameRef *VS_CC aWarpSharp2GetFrame(int n, int activationReason, 
                     for (int i = 0; i < (d->blur_level + 1) / 2; i++)
                         d->blur(mask_uv, dstp, stride_uv, width_uv, height_uv);
 
-                    d->warp(srcp, mask_uv, dstp, stride_uv, stride_uv, stride_uv, width_uv, height_uv, d->depth / 2, d->vi->format->bitsPerSample);
+                    d->warp(srcp, mask_uv, dstp, stride_uv, stride_uv, stride_uv, width_uv, height_uv, d->depth[plane], d->vi->format->bitsPerSample);
                 }
 
                 vs_aligned_free(mask_uv);
-            } else if (d->chroma == 0) {
+            } else if (d->chroma == WarpAlongLuma) {
                 int stride_y = vsapi->getStride(src, 0);
                 int stride_uv = vsapi->getStride(src, 1);
                 int width_uv = vsapi->getFrameWidth(src, 1);
                 int height_uv = vsapi->getFrameHeight(src, 1);
 
                 if (d->bilinear_downscale)
-                    d->bilinear_downscale(mask_y, stride_y, d->vi->width, d->vi->height);
+                    d->bilinear_downscale(mask_y, stride_y, d->vi->width, d->vi->height, d->cplace);
 
                 for (int plane = 1; plane < fmt->numPlanes; plane++) {
                     if (!d->process[plane])
@@ -632,7 +685,7 @@ static const VSFrameRef *VS_CC aWarpSharp2GetFrame(int n, int activationReason, 
                     const uint8_t *srcp = vsapi->getReadPtr(src, plane);
                     uint8_t *dstp = vsapi->getWritePtr(dst, plane);
 
-                    d->warp(srcp, mask_y, dstp, stride_uv, stride_y, stride_uv, width_uv, height_uv, d->depth / 2, d->vi->format->bitsPerSample);
+                    d->warp(srcp, mask_y, dstp, stride_uv, stride_y, stride_uv, width_uv, height_uv, d->depth[plane], d->vi->format->bitsPerSample);
                 }
             }
         }
@@ -651,6 +704,8 @@ static const VSFrameRef *VS_CC aWarpSharp2GetFrame(int n, int activationReason, 
 
 
 static const VSFrameRef *VS_CC aSobelGetFrame(int n, int activationReason, void **instanceData, void **frameData, VSFrameContext *frameCtx, VSCore *core, const VSAPI *vsapi) {
+    (void)frameData;
+
     const AWarpSharp2Data *d = (const AWarpSharp2Data *) * instanceData;
 
     if (activationReason == arInitial) {
@@ -692,6 +747,8 @@ static const VSFrameRef *VS_CC aSobelGetFrame(int n, int activationReason, void 
 
 
 static const VSFrameRef *VS_CC aBlurGetFrame(int n, int activationReason, void **instanceData, void **frameData, VSFrameContext *frameCtx, VSCore *core, const VSAPI *vsapi) {
+    (void)frameData;
+
     const AWarpSharp2Data *d = (const AWarpSharp2Data *) * instanceData;
 
     if (activationReason == arInitial) {
@@ -734,6 +791,8 @@ static const VSFrameRef *VS_CC aBlurGetFrame(int n, int activationReason, void *
 
 
 static const VSFrameRef *VS_CC aWarpGetFrame(int n, int activationReason, void **instanceData, void **frameData, VSFrameContext *frameCtx, VSCore *core, const VSAPI *vsapi) {
+    (void)frameData;
+
     const AWarpSharp2Data *d = (const AWarpSharp2Data *) * instanceData;
 
     if (activationReason == arInitial) {
@@ -769,11 +828,11 @@ static const VSFrameRef *VS_CC aWarpGetFrame(int n, int activationReason, void *
             int dst_width_y = vsapi->getFrameWidth(dst, 0);
             int dst_height_y = vsapi->getFrameHeight(dst, 0);
 
-            d->warp(srcp, maskp, dstp, src_stride_y, dst_stride_y, dst_stride_y, dst_width_y, dst_height_y, d->depth, d->vi->format->bitsPerSample);
+            d->warp(srcp, maskp, dstp, src_stride_y, dst_stride_y, dst_stride_y, dst_width_y, dst_height_y, d->depth[0], d->vi->format->bitsPerSample);
         }
 
         if ((d->process[1] || d->process[2]) && fmt->numPlanes > 1) {
-            if (d->chroma == 1) {
+            if (d->chroma == WarpAlongChroma) {
                 int src_stride_uv = vsapi->getStride(src, 1);
                 int dst_stride_uv = vsapi->getStride(dst, 1);
                 int dst_width_uv = vsapi->getFrameWidth(dst, 1);
@@ -787,9 +846,9 @@ static const VSFrameRef *VS_CC aWarpGetFrame(int n, int activationReason, void *
                     const uint8_t *maskp = vsapi->getReadPtr(mask, plane);
                     uint8_t *dstp = vsapi->getWritePtr(dst, plane);
 
-                    d->warp(srcp, maskp, dstp, src_stride_uv, dst_stride_uv, dst_stride_uv, dst_width_uv, dst_height_uv, d->depth / 2, d->vi->format->bitsPerSample);
+                    d->warp(srcp, maskp, dstp, src_stride_uv, dst_stride_uv, dst_stride_uv, dst_width_uv, dst_height_uv, d->depth[plane], d->vi->format->bitsPerSample);
                 }
-            } else if (d->chroma == 0) {
+            } else if (d->chroma == WarpAlongLuma) {
                 int src_stride_uv = vsapi->getStride(src, 1);
                 int dst_stride_uv = vsapi->getStride(dst, 1);
                 int dst_width_uv = vsapi->getFrameWidth(dst, 1);
@@ -803,7 +862,7 @@ static const VSFrameRef *VS_CC aWarpGetFrame(int n, int activationReason, void *
 
                     memcpy(maskp, vsapi->getReadPtr(mask, 0), mask_stride_y * mask_height_y);
 
-                    d->bilinear_downscale(maskp, mask_stride_y, mask_width_y, mask_height_y);
+                    d->bilinear_downscale(maskp, mask_stride_y, mask_width_y, mask_height_y, d->cplace);
                 }
 
                 for (int plane = 1; plane < fmt->numPlanes; plane++) {
@@ -813,7 +872,7 @@ static const VSFrameRef *VS_CC aWarpGetFrame(int n, int activationReason, void *
                     const uint8_t *srcp = vsapi->getReadPtr(src, plane);
                     uint8_t *dstp = vsapi->getWritePtr(dst, plane);
 
-                    d->warp(srcp, maskp ? maskp : vsapi->getReadPtr(mask, 0), dstp, src_stride_uv, mask_stride_y, dst_stride_uv, dst_width_uv, dst_height_uv, d->depth / 2, d->vi->format->bitsPerSample);
+                    d->warp(srcp, maskp ? maskp : vsapi->getReadPtr(mask, 0), dstp, src_stride_uv, mask_stride_y, dst_stride_uv, dst_width_uv, dst_height_uv, d->depth[plane], d->vi->format->bitsPerSample);
                 }
 
                 if (maskp)
@@ -833,6 +892,8 @@ static const VSFrameRef *VS_CC aWarpGetFrame(int n, int activationReason, void *
 
 
 static void VS_CC aWarpSharp2Free(void *instanceData, VSCore *core, const VSAPI *vsapi) {
+    (void)core;
+
     AWarpSharp2Data *d = (AWarpSharp2Data *)instanceData;
 
     vsapi->freeNode(d->node);
@@ -916,6 +977,8 @@ static void selectFunctions(AWarpSharp2Data *d, bool warp4=false) {
 
 
 static void VS_CC aWarpSharp2Create(const VSMap *in, VSMap *out, void *userData, VSCore *core, const VSAPI *vsapi) {
+    (void)userData;
+
     AWarpSharp2Data d;
     AWarpSharp2Data *data;
 
@@ -933,15 +996,38 @@ static void VS_CC aWarpSharp2Create(const VSMap *in, VSMap *out, void *userData,
     if (err)
         d.blur_level = d.blur_type ? 3 : 2;
 
-    d.depth = int64ToIntS(vsapi->propGetInt(in, "depth", 0, &err));
-    if (err)
-        d.depth = 16;
+    for (int i = 0; i < 3; i++) {
+        d.depth[i] = int64ToIntS(vsapi->propGetInt(in, "depth", i, &err));
+
+        if (err) {
+            if (i == 0)
+                d.depth[i] = 16;
+            else if (i == 1)
+                d.depth[i] = d.depth[i - 1] / 2;
+            else
+                d.depth[i] = d.depth[i - 1];
+        }
+    }
 
     d.chroma = int64ToIntS(vsapi->propGetInt(in, "chroma", 0, &err));
 
     d.opt = !!vsapi->propGetInt(in, "opt", 0, &err);
     if (err)
         d.opt = 1;
+
+    const char *cplace = vsapi->propGetData(in, "cplace", 0, &err);
+    if (err) {
+        d.cplace = MPEG1;
+    } else {
+        if (strcmp(cplace, "mpeg1") == 0) {
+            d.cplace = MPEG1;
+        } else if (strcmp(cplace, "mpeg2") == 0) {
+            d.cplace = MPEG2;
+        } else {
+            vsapi->setError(out, "AWarpSharp2: cplace must be either 'mpeg1' or 'mpeg2'.");
+            return;
+        }
+    }
 
 
     if (d.thresh < 0 || d.thresh > 255) {
@@ -959,9 +1045,11 @@ static void VS_CC aWarpSharp2Create(const VSMap *in, VSMap *out, void *userData,
         return;
     }
 
-    if (d.depth < -128 || d.depth > 127) {
-        vsapi->setError(out, "AWarpSharp2: depth must be between -128 and 127 (inclusive).");
-        return;
+    for (int i = 0; i < 3; i++) {
+        if (d.depth[i] < -128 || d.depth[i] > 127) {
+            vsapi->setError(out, "AWarpSharp2: depth must be between -128 and 127 (inclusive).");
+            return;
+        }
     }
 
     if (d.chroma < 0 || d.chroma > 1) {
@@ -1025,6 +1113,8 @@ static void VS_CC aWarpSharp2Create(const VSMap *in, VSMap *out, void *userData,
 
 
 static void VS_CC aSobelCreate(const VSMap *in, VSMap *out, void *userData, VSCore *core, const VSAPI *vsapi) {
+    (void)userData;
+
     AWarpSharp2Data d;
     AWarpSharp2Data *data;
 
@@ -1096,6 +1186,8 @@ static void VS_CC aSobelCreate(const VSMap *in, VSMap *out, void *userData, VSCo
 
 
 static void VS_CC aBlurCreate(const VSMap *in, VSMap *out, void *userData, VSCore *core, const VSAPI *vsapi) {
+    (void)userData;
+
     AWarpSharp2Data d;
     AWarpSharp2Data *data;
 
@@ -1173,6 +1265,8 @@ static void VS_CC aBlurCreate(const VSMap *in, VSMap *out, void *userData, VSCor
 
 
 static void VS_CC aWarpCreate(const VSMap *in, VSMap *out, void *userData, VSCore *core, const VSAPI *vsapi) {
+    (void)userData;
+
     AWarpSharp2Data d;
     AWarpSharp2Data *data;
 
@@ -1180,9 +1274,18 @@ static void VS_CC aWarpCreate(const VSMap *in, VSMap *out, void *userData, VSCor
 
     int err;
 
-    d.depth = int64ToIntS(vsapi->propGetInt(in, "depth", 0, &err));
-    if (err)
-        d.depth = 3;
+    for (int i = 0; i < 3; i++) {
+        d.depth[i] = int64ToIntS(vsapi->propGetInt(in, "depth", i, &err));
+
+        if (err) {
+            if (i == 0)
+                d.depth[i] = 3;
+            else if (i == 1)
+                d.depth[i] = d.depth[i - 1] / 2;
+            else
+                d.depth[i] = d.depth[i - 1];
+        }
+    }
 
     d.chroma = int64ToIntS(vsapi->propGetInt(in, "chroma", 0, &err));
 
@@ -1190,10 +1293,26 @@ static void VS_CC aWarpCreate(const VSMap *in, VSMap *out, void *userData, VSCor
     if (err)
         d.opt = 1;
 
+    const char *cplace = vsapi->propGetData(in, "cplace", 0, &err);
+    if (err) {
+        d.cplace = MPEG1;
+    } else {
+        if (strcmp(cplace, "mpeg1") == 0) {
+            d.cplace = MPEG1;
+        } else if (strcmp(cplace, "mpeg2") == 0) {
+            d.cplace = MPEG2;
+        } else {
+            vsapi->setError(out, "AWarp: cplace must be either 'mpeg1' or 'mpeg2'.");
+            return;
+        }
+    }
 
-    if (d.depth < -128 || d.depth > 127) {
-        vsapi->setError(out, "AWarp: depth must be between -128 and 127 (inclusive).");
-        return;
+
+    for (int i = 0; i < 3; i++) {
+        if (d.depth[i] < -128 || d.depth[i] > 127) {
+            vsapi->setError(out, "AWarp: depth must be between -128 and 127 (inclusive).");
+            return;
+        }
     }
 
     if (d.chroma < 0 || d.chroma > 1) {
@@ -1279,10 +1398,11 @@ VS_EXTERNAL_API(void) VapourSynthPluginInit(VSConfigPlugin configFunc, VSRegiste
             "thresh:int:opt;"
             "blur:int:opt;"
             "type:int:opt;"
-            "depth:int:opt;"
+            "depth:int[]:opt;"
             "chroma:int:opt;"
             "planes:int[]:opt;"
             "opt:int:opt;"
+            "cplace:data:opt;"
             , aWarpSharp2Create, 0, plugin);
 
     registerFunc("ASobel",
@@ -1303,9 +1423,10 @@ VS_EXTERNAL_API(void) VapourSynthPluginInit(VSConfigPlugin configFunc, VSRegiste
     registerFunc("AWarp",
             "clip:clip;"
             "mask:clip;"
-            "depth:int:opt;"
+            "depth:int[]:opt;"
             "chroma:int:opt;"
             "planes:int[]:opt;"
             "opt:int:opt;"
+            "cplace:data:opt;"
             , aWarpCreate, 0, plugin);
 }
