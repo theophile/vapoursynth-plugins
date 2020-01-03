@@ -1,3 +1,26 @@
+/*
+* The MIT License (MIT)
+* Copyright (c) 2015 amigo(white luckers), tanakamura, DeadSix27, YukihoAA and contributors
+* 
+* Permission is hereby granted, free of charge, to any person obtaining a copy
+* of this software and associated documentation files (the "Software"), to deal
+* in the Software without restriction, including without limitation the rights
+* to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+* copies of the Software, and to permit persons to whom the Software is
+* furnished to do so, subject to the following conditions:
+* 
+* The above copyright notice and this permission notice shall be included in all
+* copies or substantial portions of the Software.
+* 
+* THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+* IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+* FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+* AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+* LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+* OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+* SOFTWARE.
+*/
+
 /* -*- mode: c++ -*- */
 
 #define UNROLL9(F)				\
@@ -477,11 +500,11 @@ filter_i128(const float * __restrict__ packed_input,
 #if __CUDA_ARCH__ >= 300
 static inline __device__ float
 warp_sum(float v) {
-	v += __shfl_down(v, 1);
-	v += __shfl_down(v, 2);
-	v += __shfl_down(v, 4);
-	v += __shfl_down(v, 8);
-	v += __shfl_down(v, 16);
+	v += __shfl_down_sync(0xFFFFFFFF, v, 1);
+	v += __shfl_down_sync(0xFFFFFFFF, v, 2);
+	v += __shfl_down_sync(0xFFFFFFFF, v, 4);
+	v += __shfl_down_sync(0xFFFFFFFF, v, 8);
+	v += __shfl_down_sync(0xFFFFFFFF, v, 16);
 	return v;
 }
 #endif
@@ -1352,7 +1375,6 @@ filter_i128_o3(const float * __restrict__ packed_input,
 
 	unsigned int yi = blockIdx.x;
 	unsigned int lid = threadIdx.x;
-	int slid = threadIdx.x;
 
 	size_t in_step = wsz * nInputPlanes;
 

@@ -21,62 +21,60 @@
 * SOFTWARE.
 */
 
-#ifndef W2XC_SEC_HPP
-#define W2XC_SEC_HPP
+#ifndef __TCHAR_H__
+#define __TCHAR_H__
 
-#include "compiler.h"
-
-#ifdef _WIN32
-#include <windows.h>
-
-static double UNUSED getsec(void)
-{
-    LARGE_INTEGER c;
-    LARGE_INTEGER freq;
-
-    QueryPerformanceFrequency(&freq);
-    QueryPerformanceCounter(&c);
-
-    return c.QuadPart/ (double)freq.QuadPart;
-}
-
-
-#elif __MACH__
-#include <sys/time.h>
-static int UNUSED clock_gettime(int /* clk_id*/, struct timespec* t)
-{
-	struct timeval now;
-	int rv = gettimeofday(&now, NULL);
-	if (rv) return rv;
-	t->tv_sec  = now.tv_sec;
-	t->tv_nsec = now.tv_usec * 1000;
-	return 0;
-}
-
-static double getsec(void) // UNUSED
-{
-    struct timespec ts;
-    clock_gettime(0, &ts);
-
-    return (ts.tv_sec) + (ts.tv_nsec / (1000.0*1000.0*1000.0));
-}
-
+#if defined(_WIN32) && defined(_UNICODE)
+	#define	_T(x)	L ## x
 #else
-
-#include <time.h>
-#include <unistd.h>
-
-static double UNUSED getsec(void)
-{
-    struct timespec ts;
-#ifdef CLOCK_MONOTONIC_RAW
-    clock_gettime(CLOCK_MONOTONIC_RAW, &ts);
-#else
-    clock_gettime(CLOCK_MONOTONIC, &ts);
+	#define	_T(x)	x
 #endif
-    return (ts.tv_sec) + (ts.tv_nsec / (1000.0*1000.0*1000.0));
-}
 
+
+#if defined(_WIN32) && defined(_UNICODE)
+	#define	_tmain		wmain
+	#define	_tcslen		wcslen
+	#define	_tcscat		wcscat
+	#define _tcschr		wcschr
+	#define	_tcscpy		wcscpy
+	#define	_tcsncpy	wcsncpy
+	#define	_tcscmp		wcscmp
+	#define	_tcsncmp	wcsncmp
+	#define _tcsstr		wcsstr
+	#define _tcsrev		_wcsrev
+	#define	_tprintf	wprintf
+	#define	_stprintf	swprintf
+	#define	_tscanf		wscanf
+	#define _tfopen		_wfopen
+	#define	_fgetts		fgetws
+	#define	_fputts		fputws
+	#define _totlower	towlower
+	#define _to_tstring	to_wstring
+#else
+	#define	_tmain		main
+	#define	_tcslen		strlen
+	#define	_tcscat		strcat
+	#define _tcschr		strchr
+	#define	_tcscpy		strcpy
+	#define	_tcsncpy	strncpy
+	#define	_tcscmp		strcmp
+	#define _tcsncmp	strncmp
+	#define _tcsstr		strstr
+	#define _tcsrev		strrev
+	#define	_tprintf	printf
+	#define	_stprintf	sprintf
+	#define	_tscanf		scanf
+	#define _tfopen		fopen
+	#define _fgetts		fgets
+	#define	_fputts		fputs
+	#define _totlower	tolower
+	#define _to_tstring	to_string
+#endif
+
+#if defined(_WIN32) && defined(_UNICODE)
+	typedef	wchar_t	TCHAR;
+#else
+	typedef	char	TCHAR;
 #endif
 
 #endif

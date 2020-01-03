@@ -1,97 +1,104 @@
+/*
+* The MIT License (MIT)
+* Copyright (c) 2015 amigo(white luckers), tanakamura, DeadSix27, YukihoAA and contributors
+* 
+* Permission is hereby granted, free of charge, to any person obtaining a copy
+* of this software and associated documentation files (the "Software"), to deal
+* in the Software without restriction, including without limitation the rights
+* to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+* copies of the Software, and to permit persons to whom the Software is
+* furnished to do so, subject to the following conditions:
+* 
+* The above copyright notice and this permission notice shall be included in all
+* copies or substantial portions of the Software.
+* 
+* THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+* IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+* FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+* AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+* LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+* OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+* SOFTWARE.
+*/
+
 #ifndef W2MAT_HPP
 #define W2MAT_HPP
 
 #include <utility>
 #include <vector>
 
-struct W2Mat {
-    bool data_owner;
 
-    char *data;
-    int data_byte_width;
-    int data_height;
+#ifdef HAVE_OPENCV
+	#include <opencv2/opencv.hpp>
+#else
+	#define CV_32FC3 12
+	#define CV_32FC1 4
+	#define CV_8UC3 3
+	#define CV_8UC1 1
+	#define CV_ELEM_SIZE(type) (type)
+#endif
 
-    int view_top;
-    int view_left;
-    int view_width;
-    int view_height;
+class W2Mat {
+	public:
+		bool data_owner;
 
-    int type;
+		char *data;
+		int data_byte_width;
+		int data_height;
 
-    W2Mat(int data_width, int data_height, int type);
-    W2Mat(int data_width, int data_height, int type, void *data, int data_step);
-    W2Mat();
+		int view_top;
+		int view_left;
+		int view_width;
+		int view_height;
 
-    W2Mat(const W2Mat &) = delete;
-    W2Mat& operator=(const W2Mat&) = delete;
+		int type;
 
-    W2Mat & operator= (W2Mat &&);
-    W2Mat(W2Mat &&rhs) {
-        *this = std::move(rhs);
-    }
+		W2Mat(int data_width, int data_height, int type);
+		W2Mat(int data_width, int data_height, int type, void *data, int data_step);
+		W2Mat(const W2Mat &rhs, int view_left_offset, int view_top_offset, int view_width, int view_height);
+		W2Mat();
 
-    ~W2Mat();
+		W2Mat(const W2Mat &) = delete;
+		W2Mat& operator=(const W2Mat&) = delete;
 
-    static W2Mat copy_full(W2Mat &rhs);
-    static W2Mat clip_view(const W2Mat &rhs,
-                           int view_left_offset, int view_top_offset, 
-                           int view_width, int view_height);
+		W2Mat& operator= (W2Mat &&);
+		W2Mat(W2Mat &&rhs)
+		{
+			*this = std::move(rhs);
+		}
 
-    template<typename T> T *ptr(int yi);
-    template<typename T> T &at(int y, int x) {
-        return this->ptr<T>(y)[x];
-    }
+		~W2Mat();
+
+		void copyTo(W2Mat*);
+			
+#ifdef HAVE_OPENCV
+		W2Mat(cv::Mat &);
+		void to_cvmat(cv::Mat *);
+#endif
+
+		template<typename T> T *ptr(int yi);
+		template<typename T> T &at(int y, int x)
+		{
+			return this->ptr<T>(y)[x];
+		}
 };
 
-struct W2Size {
+struct W2Size
+{
     int width, height;
 
-    W2Size(int w, int h)
-        :width(w), height(h)
-    {}
+    W2Size(int w, int h) : width(w), height(h) {}
 };
 
 #ifdef HAVE_OPENCV
-#include <opencv2/opencv.hpp>
 
-typedef cv::Mat Mat_t;
-typedef cv::Point Point_t;
-
-W2Mat copy_from_cvmat(cv::Mat &m);
-cv::Mat copy_to_cvmat(W2Mat &m);
-W2Mat extract_view_from_cvmat(cv::Mat &m);
-cv::Mat extract_view_to_cvmat(W2Mat &m);
-
-W2Mat extract_view_from_cvmat_offset(cv::Mat &m,
-                                     int view_left_offset,
-                                     int view_top_offset,
-                                     int view_width,
-                                     int view_height);
-
-std::vector<W2Mat> extract_viewlist_from_cvmat(std::vector<cv::Mat> &list);
-std::vector<cv::Mat> extract_viewlist_to_cvmat(std::vector<W2Mat> &list);
-
-static inline cv::Size cvSize_from_w2(W2Size const &s) {
-    return cv::Size(s.width, s.height);
-}
-
-static inline W2Size W2Size_from_cv(cv::Size const &sz) {
-    return W2Size(sz.width, sz.height);
-}
-
-#else
-
-#define CV_32FC3 12
-#define CV_32FC1 4
-#define CV_8UC3 3
-#define CV_8UC1 1
-
-#define CV_ELEM_SIZE(type) (type)
-
+void extract_viewlist_from_cvmat(std::vector<W2Mat> &list, std::vector<cv::Mat> &cvmat);
+void extract_viewlist_to_cvmat(std::vector<cv::Mat> &cvmat, std::vector<W2Mat> &list);
+	
 #endif
 
-template<typename T> T *
-W2Mat::ptr(int yi){
+template<typename T> T * W2Mat::ptr(int yi)
+{
     int off = 0;
     int elem_size = CV_ELEM_SIZE(this->type);
 

@@ -21,8 +21,25 @@
 * SOFTWARE.
 */
 
-#define VEC_WIDTH 8U
-#define UNROLL 2U
-#define GPU_VEC_WIDTH 128
-#define GPU_BLOCK_SIZE 8
 
+#include "tstring.hpp"
+
+std::string wstr2str(std::wstring ws){
+	std::setlocale(LC_ALL, "en_US.utf8");
+	char *buf = new char[ws.size()];
+	size_t num_chars = wcstombs(buf, ws.c_str(), ws.size());
+	
+	std::string s( buf, num_chars );
+	delete[] buf;
+	return s;
+}
+
+std::wstring str2wstr(std::string s){
+	std::setlocale(LC_ALL, "en_US.utf8");
+	wchar_t *buf = new wchar_t[s.size()];
+	size_t num_chars = mbstowcs(buf, s.c_str(), s.size());
+	
+	std::wstring ws( buf, num_chars );
+	delete[] buf;
+	return ws;
+}

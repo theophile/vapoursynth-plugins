@@ -21,8 +21,36 @@
 * SOFTWARE.
 */
 
-#define VEC_WIDTH 8U
-#define UNROLL 2U
-#define GPU_VEC_WIDTH 128
-#define GPU_BLOCK_SIZE 8
+#ifndef __TSTRING_H__
+#define __TSTRING_H__
 
+#include <string>
+#include <clocale>
+#include "tchar.h"
+
+std::string wstr2str(std::wstring ws);
+std::wstring str2wstr(std::string s);
+
+#if defined(_WIN32) && defined(_UNICODE)
+	typedef	std::wstring		_tstring;
+	typedef	std::wstringstream	_tstringstream;
+	#define _tstr2wstr(X) X;
+	#define _tstr2str(X) wstr2str(X);
+	#define _wstr2tstr(X) X;
+	#define _str2tstr(X) str2wstr(X);
+#else
+	typedef	std::string			_tstring;
+	typedef	std::stringstream	_tstringstream;
+	#define _tstr2wstr(X) str2wstr(X);
+	#define _tstr2str(X) X;
+	#define _wstr2tstr(X) wstr2str(X);
+	#define _str2tstr(X) X;
+#endif
+
+#if defined(_WIN32) && defined(_UNICODE)
+	#define	TSTRING_METHOD	wstring
+#else
+	#define	TSTRING_METHOD	string
+#endif
+
+#endif
