@@ -21,20 +21,25 @@
 */
 
 #include <cerrno>
-#include <clocale>
 #include <cstdio>
-#include <memory>
-#include <string>
-#include <thread>
-#include <unordered_map>
 
-#ifdef _WIN32
-#include <codecvt>
 #include <locale>
-#endif
+#include <memory>
+#include <sstream>
+#include <string>
 
 #include <VapourSynth.h>
 #include <VSHelper.h>
+
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#endif
 
 #define BOOST_COMPUTE_DEBUG_KERNEL_COMPILATION
 #define BOOST_COMPUTE_HAVE_THREAD_LOCAL
@@ -42,7 +47,6 @@
 #define BOOST_COMPUTE_USE_OFFLINE_CACHE
 #include <boost/compute/core.hpp>
 #include <boost/compute/utility/dim.hpp>
-#include <boost/compute/utility/source.hpp>
 namespace compute = boost::compute;
 
 #include "NNEDI3CL.cl"
@@ -58,15 +62,11 @@ struct NNEDI3CLData {
     VSVideoInfo vi;
     int field;
     bool dh, dw, process[3];
-    compute::device gpu;
-    compute::context ctx;
-    compute::program program;
+    compute::command_queue queue;
+    compute::kernel kernel;
+    compute::image2d src, dst, tmp;
     compute::buffer weights0, weights1Buffer;
     cl_mem weights1;
-    cl_image_format clImageFormat;
-    std::unordered_map<std::thread::id, compute::command_queue> queue;
-    std::unordered_map<std::thread::id, compute::kernel> kernel;
-    std::unordered_map<std::thread::id, compute::image2d> src, dst, tmp;
 };
 
 static inline int roundds(const double f) noexcept {
@@ -74,7 +74,7 @@ static inline int roundds(const double f) noexcept {
 }
 
 template<typename T>
-static void process(const VSFrameRef * src, VSFrameRef * dst, const int field_n, const NNEDI3CLData * d, const VSAPI * vsapi) {
+static void filter(const VSFrameRef * src, VSFrameRef * dst, const int field_n, const NNEDI3CLData * const VS_RESTRICT d, const VSAPI * vsapi) {
     for (int plane = 0; plane < d->vi.format->numPlanes; plane++) {
         if (d->process[plane]) {
             const int srcWidth = vsapi->getFrameWidth(src, plane);
@@ -84,12 +84,11 @@ static void process(const VSFrameRef * src, VSFrameRef * dst, const int field_n,
             const T * srcp = reinterpret_cast<const T *>(vsapi->getReadPtr(src, plane));
             T * VS_RESTRICT dstp = reinterpret_cast<T *>(vsapi->getWritePtr(dst, plane));
 
-            const auto threadId = std::this_thread::get_id();
-            auto queue = d->queue.at(threadId);
-            auto kernel = d->kernel.at(threadId);
-            auto srcImage = d->src.at(threadId);
-            auto dstImage = d->dst.at(threadId);
-            auto tmpImage = d->tmp.at(threadId);
+            auto queue = d->queue;
+            auto kernel = d->kernel;
+            auto srcImage = d->src;
+            auto dstImage = d->dst;
+            auto tmpImage = d->tmp;
 
             constexpr size_t localWorkSize[] = { 4, 16 };
 
@@ -119,54 +118,19 @@ static void process(const VSFrameRef * src, VSFrameRef * dst, const int field_n,
     }
 }
 
-static void VS_CC nnedi3clInit(VSMap *in, VSMap *out, void **instanceData, VSNode *node, VSCore *core, const VSAPI *vsapi) {
+static void VS_CC nnedi3clInit(VSMap * in, VSMap * out, void ** instanceData, VSNode * node, VSCore * core, const VSAPI * vsapi) {
     NNEDI3CLData * d = static_cast<NNEDI3CLData *>(*instanceData);
     vsapi->setVideoInfo(&d->vi, 1, node);
 }
 
-static const VSFrameRef *VS_CC nnedi3clGetFrame(int n, int activationReason, void **instanceData, void **frameData, VSFrameContext *frameCtx, VSCore *core, const VSAPI *vsapi) {
+static const VSFrameRef * VS_CC nnedi3clGetFrame(int n, int activationReason, void ** instanceData, void ** frameData, VSFrameContext * frameCtx, VSCore * core, const VSAPI * vsapi) {
     NNEDI3CLData * d = static_cast<NNEDI3CLData *>(*instanceData);
 
     if (activationReason == arInitial) {
         vsapi->requestFrameFilter(d->field > 1 ? n / 2 : n, d->node, frameCtx);
     } else if (activationReason == arAllFramesReady) {
-        try {
-            auto threadId = std::this_thread::get_id();
-
-            if (!d->queue.count(threadId))
-                d->queue.emplace(threadId, compute::command_queue{ d->ctx, d->gpu });
-
-            if (!d->kernel.count(threadId)) {
-                if (d->vi.format->sampleType == stInteger)
-                    d->kernel.emplace(threadId, d->program.create_kernel("process_uint"));
-                else
-                    d->kernel.emplace(threadId, d->program.create_kernel("process_float"));
-            }
-
-            if (!d->src.count(threadId))
-                d->src.emplace(threadId, compute::image2d{ d->ctx, static_cast<size_t>(vsapi->getVideoInfo(d->node)->width), static_cast<size_t>(vsapi->getVideoInfo(d->node)->height), compute::image_format{ d->clImageFormat }, CL_MEM_READ_ONLY | CL_MEM_HOST_WRITE_ONLY });
-
-            if (!d->dst.count(threadId))
-                d->dst.emplace(threadId, compute::image2d{ d->ctx, static_cast<size_t>(std::max(d->vi.width, d->vi.height)), static_cast<size_t>(std::max(d->vi.width, d->vi.height)), compute::image_format{ d->clImageFormat }, CL_MEM_READ_WRITE | CL_MEM_HOST_READ_ONLY });
-
-            if (!d->tmp.count(threadId)) {
-                if (d->dh && d->dw)
-                    d->tmp.emplace(threadId, compute::image2d{ d->ctx, static_cast<size_t>(std::max(d->vi.width, d->vi.height)), static_cast<size_t>(std::max(d->vi.width, d->vi.height)), compute::image_format{ d->clImageFormat }, CL_MEM_READ_WRITE | CL_MEM_HOST_NO_ACCESS });
-                else
-                    d->tmp.emplace(threadId, compute::image2d{});
-            }
-        } catch (const std::string & error) {
-            vsapi->setFilterError(("NNEDI3CL: " + error).c_str(), frameCtx);
-            return nullptr;
-        } catch (const compute::opencl_error & error) {
-            vsapi->setFilterError(("NNEDI3CL: " + error.error_string()).c_str(), frameCtx);
-            return nullptr;
-        }
-
         const VSFrameRef * src = vsapi->getFrameFilter(d->field > 1 ? n / 2 : n, d->node, frameCtx);
-        const VSFrameRef * fr[] = { d->process[0] ? nullptr : src, d->process[1] ? nullptr : src, d->process[2] ? nullptr : src };
-        const int pl[] = { 0, 1, 2 };
-        VSFrameRef * dst = vsapi->newVideoFrame2(d->vi.format, d->vi.width, d->vi.height, fr, pl, src, core);
+        VSFrameRef * dst = vsapi->newVideoFrame(d->vi.format, d->vi.width, d->vi.height, src, core);
 
         int field = d->field;
         if (field > 1)
@@ -191,11 +155,11 @@ static const VSFrameRef *VS_CC nnedi3clGetFrame(int n, int activationReason, voi
 
         try {
             if (d->vi.format->bytesPerSample == 1)
-                process<uint8_t>(src, dst, field_n, d, vsapi);
+                filter<uint8_t>(src, dst, field_n, d, vsapi);
             else if (d->vi.format->bytesPerSample == 2)
-                process<uint16_t>(src, dst, field_n, d, vsapi);
+                filter<uint16_t>(src, dst, field_n, d, vsapi);
             else
-                process<float>(src, dst, field_n, d, vsapi);
+                filter<float>(src, dst, field_n, d, vsapi);
         } catch (const compute::opencl_error & error) {
             vsapi->setFilterError(("NNEDI3CL: " + error.error_string()).c_str(), frameCtx);
             vsapi->freeFrame(src);
@@ -224,7 +188,7 @@ static const VSFrameRef *VS_CC nnedi3clGetFrame(int n, int activationReason, voi
     return nullptr;
 }
 
-static void VS_CC nnedi3clFree(void *instanceData, VSCore *core, const VSAPI *vsapi) {
+static void VS_CC nnedi3clFree(void * instanceData, VSCore * core, const VSAPI * vsapi) {
     NNEDI3CLData * d = static_cast<NNEDI3CLData *>(instanceData);
 
     vsapi->freeNode(d->node);
@@ -234,15 +198,16 @@ static void VS_CC nnedi3clFree(void *instanceData, VSCore *core, const VSAPI *vs
     delete d;
 }
 
-void VS_CC nnedi3clCreate(const VSMap *in, VSMap *out, void *userData, VSCore *core, const VSAPI *vsapi) {
-    std::unique_ptr<NNEDI3CLData> d{ new NNEDI3CLData{} };
+void VS_CC nnedi3clCreate(const VSMap * in, VSMap * out, void * userData, VSCore * core, const VSAPI * vsapi) {
+    std::unique_ptr<NNEDI3CLData> d = std::make_unique<NNEDI3CLData>();
     int err;
 
     d->node = vsapi->propGetNode(in, "clip", 0, nullptr);
     d->vi = *vsapi->getVideoInfo(d->node);
 
     try {
-        if (!isConstantFormat(&d->vi) || (d->vi.format->sampleType == stInteger && d->vi.format->bitsPerSample > 16) ||
+        if (!isConstantFormat(&d->vi) ||
+            (d->vi.format->sampleType == stInteger && d->vi.format->bitsPerSample > 16) ||
             (d->vi.format->sampleType == stFloat && d->vi.format->bitsPerSample != 32))
             throw std::string{ "only constant format 8-16 bit integer and 32 bit float input supported" };
 
@@ -287,9 +252,9 @@ void VS_CC nnedi3clCreate(const VSMap *in, VSMap *out, void *userData, VSCore *c
         if (err)
             pscrn = (d->vi.format->sampleType == stInteger) ? 2 : 1;
 
-        int device = int64ToIntS(vsapi->propGetInt(in, "device", 0, &err));
+        int device_id = int64ToIntS(vsapi->propGetInt(in, "device", 0, &err));
         if (err)
-            device = -1;
+            device_id = -1;
 
         if (d->field < 0 || d->field > 3)
             throw std::string{ "field must be 0, 1, 2 or 3" };
@@ -323,7 +288,7 @@ void VS_CC nnedi3clCreate(const VSMap *in, VSMap *out, void *userData, VSCore *c
                 throw std::string{ "pscrn must be 1 for float input" };
         }
 
-        if (device >= static_cast<int>(compute::system::device_count()))
+        if (device_id >= static_cast<int>(compute::system::device_count()))
             throw std::string{ "device index out of range" };
 
         if (!!vsapi->propGetInt(in, "list_device", 0, &err)) {
@@ -332,6 +297,74 @@ void VS_CC nnedi3clCreate(const VSMap *in, VSMap *out, void *userData, VSCore *c
 
             for (size_t i = 0; i < devices.size(); i++)
                 text += std::to_string(i) + ": " + devices[i].name() + " (" + devices[i].platform().name() + ")" + "\n";
+
+            VSMap * args = vsapi->createMap();
+            vsapi->propSetNode(args, "clip", d->node, paReplace);
+            vsapi->freeNode(d->node);
+            vsapi->propSetData(args, "text", text.c_str(), -1, paReplace);
+
+            VSMap * ret = vsapi->invoke(vsapi->getPluginById("com.vapoursynth.text", core), "Text", args);
+            if (vsapi->getError(ret)) {
+                vsapi->setError(out, vsapi->getError(ret));
+                vsapi->freeMap(args);
+                vsapi->freeMap(ret);
+                return;
+            }
+
+            d->node = vsapi->propGetNode(ret, "clip", 0, nullptr);
+            vsapi->freeMap(args);
+            vsapi->freeMap(ret);
+            vsapi->propSetNode(out, "clip", d->node, paReplace);
+            vsapi->freeNode(d->node);
+            return;
+        }
+
+        compute::device device = compute::system::default_device();
+        if (device_id > -1)
+            device = compute::system::devices().at(device_id);
+        compute::context context{ device };
+        d->queue = compute::command_queue{ context, device };
+
+        if (!!vsapi->propGetInt(in, "info", 0, &err)) {
+            std::string text{ "=== Platform Info ===\n" };
+            const auto platform = device.platform();
+            text += "Profile: " + platform.get_info<CL_PLATFORM_PROFILE>() + "\n";
+            text += "Version: " + platform.get_info<CL_PLATFORM_VERSION>() + "\n";
+            text += "Name: " + platform.get_info<CL_PLATFORM_NAME>() + "\n";
+            text += "Vendor: " + platform.get_info<CL_PLATFORM_VENDOR>() + "\n";
+
+            text += "\n";
+
+            text += "=== Device Info ===\n";
+            text += "Name: " + device.get_info<CL_DEVICE_NAME>() + "\n";
+            text += "Vendor: " + device.get_info<CL_DEVICE_VENDOR>() + "\n";
+            text += "Profile: " + device.get_info<CL_DEVICE_PROFILE>() + "\n";
+            text += "Version: " + device.get_info<CL_DEVICE_VERSION>() + "\n";
+            text += "Max compute units: " + std::to_string(device.get_info<CL_DEVICE_MAX_COMPUTE_UNITS>()) + "\n";
+            text += "Max work-group size: " + std::to_string(device.get_info<CL_DEVICE_MAX_WORK_GROUP_SIZE>()) + "\n";
+            const auto max_work_item_sizes = device.get_info<CL_DEVICE_MAX_WORK_ITEM_SIZES>();
+            text += "Max work-item sizes: " + std::to_string(max_work_item_sizes[0]) + ", " + std::to_string(max_work_item_sizes[1]) + ", " + std::to_string(max_work_item_sizes[2]) + "\n";
+            text += "2D image max width: " + std::to_string(device.get_info<CL_DEVICE_IMAGE2D_MAX_WIDTH>()) + "\n";
+            text += "2D image max height: " + std::to_string(device.get_info<CL_DEVICE_IMAGE2D_MAX_HEIGHT>()) + "\n";
+            text += "Image support: " + std::string{ device.get_info<CL_DEVICE_IMAGE_SUPPORT>() ? "CL_TRUE" : "CL_FALSE" } +"\n";
+            const auto global_mem_cache_type = device.get_info<CL_DEVICE_GLOBAL_MEM_CACHE_TYPE>();
+            if (global_mem_cache_type == CL_NONE)
+                text += "Global memory cache type: CL_NONE\n";
+            else if (global_mem_cache_type == CL_READ_ONLY_CACHE)
+                text += "Global memory cache type: CL_READ_ONLY_CACHE\n";
+            else if (global_mem_cache_type == CL_READ_WRITE_CACHE)
+                text += "Global memory cache type: CL_READ_WRITE_CACHE\n";
+            text += "Global memory cache size: " + std::to_string(device.get_info<CL_DEVICE_GLOBAL_MEM_CACHE_SIZE>() / 1024) + " KB\n";
+            text += "Global memory size: " + std::to_string(device.get_info<CL_DEVICE_GLOBAL_MEM_SIZE>() / (1024 * 1024)) + " MB\n";
+            text += "Max constant buffer size: " + std::to_string(device.get_info<CL_DEVICE_MAX_CONSTANT_BUFFER_SIZE>() / 1024) + " KB\n";
+            text += "Max constant arguments: " + std::to_string(device.get_info<CL_DEVICE_MAX_CONSTANT_ARGS>()) + "\n";
+            text += "Local memory type: " + std::string{ device.get_info<CL_DEVICE_LOCAL_MEM_TYPE>() == CL_LOCAL ? "CL_LOCAL" : "CL_GLOBAL" } +"\n";
+            text += "Local memory size: " + std::to_string(device.get_info<CL_DEVICE_LOCAL_MEM_SIZE>() / 1024) + " KB\n";
+            text += "Available: " + std::string{ device.get_info<CL_DEVICE_AVAILABLE>() ? "CL_TRUE" : "CL_FALSE" } +"\n";
+            text += "Compiler available: " + std::string{ device.get_info<CL_DEVICE_COMPILER_AVAILABLE>() ? "CL_TRUE" : "CL_FALSE" } +"\n";
+            text += "OpenCL C version: " + device.get_info<CL_DEVICE_OPENCL_C_VERSION>() + "\n";
+            text += "Linker available: " + std::string{ device.get_info<CL_DEVICE_LINKER_AVAILABLE>() ? "CL_TRUE" : "CL_FALSE" } +"\n";
+            text += "Image max buffer size: " + std::to_string(device.get_info<size_t>(CL_DEVICE_IMAGE_MAX_BUFFER_SIZE) / 1024) + " KB";
 
             VSMap * args = vsapi->createMap();
             vsapi->propSetNode(args, "clip", d->node, paReplace);
@@ -370,20 +403,15 @@ void VS_CC nnedi3clCreate(const VSMap *in, VSMap *out, void *userData, VSCore *c
 
         const int peak = (1 << d->vi.format->bitsPerSample) - 1;
 
-        const unsigned numThreads = vsapi->getCoreInfo(core)->numThreads;
-        d->queue.reserve(numThreads);
-        d->kernel.reserve(numThreads);
-        d->src.reserve(numThreads);
-        d->dst.reserve(numThreads);
-        d->tmp.reserve(numThreads);
-
         const std::string pluginPath{ vsapi->getPluginPath(vsapi->getPluginById("com.holywu.nnedi3cl", core)) };
         std::string weightsPath{ pluginPath.substr(0, pluginPath.find_last_of('/')) + "/nnedi3_weights.bin" };
 
         FILE * weightsFile = nullptr;
 #ifdef _WIN32
-        std::wstring_convert<std::codecvt_utf8_utf16<wchar_t>, wchar_t> utf16;
-        weightsFile = _wfopen(utf16.from_bytes(weightsPath).c_str(), L"rb");
+        const int requiredSize = MultiByteToWideChar(CP_UTF8, 0, weightsPath.c_str(), -1, nullptr, 0);
+        std::unique_ptr<wchar_t[]> wbuffer = std::make_unique<wchar_t[]>(requiredSize);
+        MultiByteToWideChar(CP_UTF8, 0, weightsPath.c_str(), -1, wbuffer.get(), requiredSize);
+        weightsFile = _wfopen(wbuffer.get(), L"rb");
 #else
         weightsFile = std::fopen(weightsPath.c_str(), "rb");
 #endif
@@ -453,47 +481,47 @@ void VS_CC nnedi3clCreate(const VSMap *in, VSMap *out, void *userData, VSCore *c
             const float * bdw = bdata + dims0 + dims0new * (pscrn - 2);
             short * ws = reinterpret_cast<short *>(weights0);
             float * wf = reinterpret_cast<float *>(&ws[4 * 64]);
-            double mean[4] = { 0., 0., 0., 0. };
+            double mean[4] = { 0.0, 0.0, 0.0, 0.0 };
 
             // Calculate mean weight of each first layer neuron
             for (int j = 0; j < 4; j++) {
-                double cmean = 0.;
+                double cmean = 0.0;
                 for (int k = 0; k < 64; k++)
                     cmean += bdw[offt[j * 64 + k]];
 
-                mean[j] = cmean / 64.;
+                mean[j] = cmean / 64.0;
             }
 
-            const double half = peak / 2.;
+            const double half = peak / 2.0;
 
             // Factor mean removal and 1.0/half scaling into first layer weights. scale to int16 range
             for (int j = 0; j < 4; j++) {
-                double mval = 0.;
+                double mval = 0.0;
                 for (int k = 0; k < 64; k++)
                     mval = std::max(mval, std::abs((bdw[offt[j * 64 + k]] - mean[j]) / half));
 
-                const double scale = 32767. / mval;
+                const double scale = 32767.0 / mval;
                 for (int k = 0; k < 64; k++)
                     ws[offt[j * 64 + k]] = roundds(((bdw[offt[j * 64 + k]] - mean[j]) / half) * scale);
 
-                wf[j] = static_cast<float>(mval / 32767.);
+                wf[j] = static_cast<float>(mval / 32767.0);
             }
 
             memcpy(wf + 4, bdw + 4 * 64, (dims0new - 4 * 64) * sizeof(float));
             free(offt);
         } else { // using old prescreener
-            double mean[4] = { 0., 0., 0., 0. };
+            double mean[4] = { 0.0, 0.0, 0.0, 0.0 };
 
             // Calculate mean weight of each first layer neuron
             for (int j = 0; j < 4; j++) {
-                double cmean = 0.;
+                double cmean = 0.0;
                 for (int k = 0; k < 48; k++)
                     cmean += bdata[j * 48 + k];
 
-                mean[j] = cmean / 48.;
+                mean[j] = cmean / 48.0;
             }
 
-            const double half = (d->vi.format->sampleType == stInteger ? peak : 1.) / 2.;
+            const double half = (d->vi.format->sampleType == stInteger ? peak : 1.0) / 2.0;
 
             // Factor mean removal and 1.0/half scaling into first layer weights
             for (int j = 0; j < 4; j++) {
@@ -515,7 +543,7 @@ void VS_CC nnedi3clCreate(const VSMap *in, VSMap *out, void *userData, VSCore *c
 
             // Calculate mean weight of each neuron (ignore bias)
             for (int j = 0; j < nnst * 2; j++) {
-                double cmean = 0.;
+                double cmean = 0.0;
                 for (int k = 0; k < asize; k++)
                     cmean += bdataT[j * asize + k];
 
@@ -534,10 +562,10 @@ void VS_CC nnedi3clCreate(const VSMap *in, VSMap *out, void *userData, VSCore *c
             // Factor mean removal into weights, and remove global offset from softmax neurons
             for (int j = 0; j < nnst * 2; j++) {
                 for (int k = 0; k < asize; k++) {
-                    const double q = (j < nnst) ? mean[k] : 0.;
+                    const double q = (j < nnst) ? mean[k] : 0.0;
                     weightsT[j * asize + k] = static_cast<float>(bdataT[j * asize + k] - mean[asize + 1 + j] - q);
                 }
-                weightsT[boff + j] = static_cast<float>(bdataT[boff + j] - (j < nnst ? mean[asize] : 0.));
+                weightsT[boff + j] = static_cast<float>(bdataT[boff + j] - (j < nnst ? mean[asize] : 0.0));
             }
 
             free(mean);
@@ -553,114 +581,94 @@ void VS_CC nnedi3clCreate(const VSMap *in, VSMap *out, void *userData, VSCore *c
         const int xOffset = (xdia == 8) ? (pscrn == 1 ? 2 : 4) : 0;
         const int inputWidth = std::max(xdia, (pscrn == 1) ? 12 : 16) + 32 - 1;
         const int inputHeight = ydia + 16 - 1;
-        const float scaleAsize = 1.f / asize;
-        const float scaleQual = 1.f / qual;
+        const float scaleAsize = 1.0f / asize;
+        const float scaleQual = 1.0f / qual;
 
-        d->gpu = compute::system::default_device();
-        if (device > -1)
-            d->gpu = compute::system::devices().at(device);
-        d->ctx = compute::context{ d->gpu };
-
-        d->weights0 = compute::buffer{ d->ctx, std::max(dims0, dims0new) * sizeof(cl_float), CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR | CL_MEM_HOST_NO_ACCESS, weights0 };
-        d->weights1Buffer = compute::buffer{ d->ctx, dims1 * 2 * sizeof(cl_float), CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR | CL_MEM_HOST_NO_ACCESS, weights1 };
+        d->weights0 = compute::buffer{ context, std::max(dims0, dims0new) * sizeof(cl_float), CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR | CL_MEM_HOST_NO_ACCESS, weights0 };
+        d->weights1Buffer = compute::buffer{ context, dims1 * 2 * sizeof(cl_float), CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR | CL_MEM_HOST_NO_ACCESS, weights1 };
         delete[] weights0;
         delete[] weights1;
 
-        if ((size_t)dims1 * 2 > d->gpu.get_info<size_t>(CL_DEVICE_IMAGE_MAX_BUFFER_SIZE))
-            throw std::string{ "the device's 1D Image Max Buffer Size is too small. Reduce nsize/nns...or buy a new graphics card" };
+        if (static_cast<size_t>(dims1 * 2) > device.get_info<size_t>(CL_DEVICE_IMAGE_MAX_BUFFER_SIZE))
+            throw std::string{ "the device's image max buffer size is too small. Reduce nsize/nns...or buy a new graphics card" };
 
-        if (!!vsapi->propGetInt(in, "info", 0, &err)) {
-            std::string text{ "=== Device Info ===\n" };
-            text += "Name: " + d->gpu.get_info<CL_DEVICE_NAME>() + "\n";
-            text += "Vendor: " + d->gpu.get_info<CL_DEVICE_VENDOR>() + "\n";
-            text += "Profile: " + d->gpu.get_info<CL_DEVICE_PROFILE>() + "\n";
-            text += "Version: " + d->gpu.get_info<CL_DEVICE_VERSION>() + "\n";
-            text += "Global Memory Size: " + std::to_string(d->gpu.get_info<CL_DEVICE_GLOBAL_MEM_SIZE>() / 1024 / 1024) + " MB\n";
-            text += "Local Memory Size: " + std::to_string(d->gpu.get_info<CL_DEVICE_LOCAL_MEM_SIZE>() / 1024) + " KB\n";
-            text += "Local Memory Type: " + std::string{ d->gpu.get_info<CL_DEVICE_LOCAL_MEM_TYPE>() == CL_LOCAL ? "CL_LOCAL" : "CL_GLOBAL" } +"\n";
-            text += "Image Support: " + std::string{ d->gpu.get_info<CL_DEVICE_IMAGE_SUPPORT>() ? "CL_TRUE" : "CL_FALSE" } +"\n";
-            text += "1D Image Max Buffer Size: " + std::to_string(d->gpu.get_info<size_t>(CL_DEVICE_IMAGE_MAX_BUFFER_SIZE)) + "\n";
-            text += "2D Image Max Width: " + std::to_string(d->gpu.get_info<CL_DEVICE_IMAGE2D_MAX_WIDTH>()) + "\n";
-            text += "2D Image Max Height: " + std::to_string(d->gpu.get_info<CL_DEVICE_IMAGE2D_MAX_HEIGHT>()) + "\n";
-            text += "Max Constant Arguments: " + std::to_string(d->gpu.get_info<CL_DEVICE_MAX_CONSTANT_ARGS>()) + "\n";
-            text += "Max Constant Buffer Size: " + std::to_string(d->gpu.get_info<CL_DEVICE_MAX_CONSTANT_BUFFER_SIZE>() / 1024) + " KB\n";
-            text += "Max Work-group Size: " + std::to_string(d->gpu.get_info<CL_DEVICE_MAX_WORK_GROUP_SIZE>()) + "\n";
-            const auto MAX_WORK_ITEM_SIZES = d->gpu.get_info<CL_DEVICE_MAX_WORK_ITEM_SIZES>();
-            text += "Max Work-item Sizes: (" + std::to_string(MAX_WORK_ITEM_SIZES[0]) + ", " + std::to_string(MAX_WORK_ITEM_SIZES[1]) + ", " + std::to_string(MAX_WORK_ITEM_SIZES[2]) + ")";
-
-            VSMap * args = vsapi->createMap();
-            vsapi->propSetNode(args, "clip", d->node, paReplace);
-            vsapi->freeNode(d->node);
-            vsapi->propSetData(args, "text", text.c_str(), -1, paReplace);
-
-            VSMap * ret = vsapi->invoke(vsapi->getPluginById("com.vapoursynth.text", core), "Text", args);
-            if (vsapi->getError(ret)) {
-                vsapi->setError(out, vsapi->getError(ret));
-                vsapi->freeMap(args);
-                vsapi->freeMap(ret);
-                return;
-            }
-
-            d->node = vsapi->propGetNode(ret, "clip", 0, nullptr);
-            vsapi->freeMap(args);
-            vsapi->freeMap(ret);
-            vsapi->propSetNode(out, "clip", d->node, paReplace);
-            vsapi->freeNode(d->node);
-            return;
-        }
-
+        compute::program program;
         try {
-            std::setlocale(LC_ALL, "C");
-            char buf[100];
-            std::string options{ "-cl-denorms-are-zero -cl-fast-relaxed-math -Werror" };
-            options += " -D QUAL=" + std::to_string(qual);
+            std::ostringstream options;
+            options.imbue(std::locale{ "C" });
+            options.precision(16);
+            options.setf(std::ios::fixed, std::ios::floatfield);
+            options << "-cl-denorms-are-zero -cl-fast-relaxed-math -Werror";
+            options << " -D QUAL=" << qual;
             if (pscrn == 1) {
-                options += " -D PRESCREEN=" + std::string{ "prescreenOld" };
-                options += " -D USE_OLD_PSCRN=" + std::to_string(1);
-                options += " -D USE_NEW_PSCRN=" + std::to_string(0);
+                options << " -D PRESCREEN=prescreenOld";
+                options << " -D USE_OLD_PSCRN=1";
+                options << " -D USE_NEW_PSCRN=0";
             } else {
-                options += " -D PRESCREEN=" + std::string{ "prescreenNew" };
-                options += " -D USE_OLD_PSCRN=" + std::to_string(0);
-                options += " -D USE_NEW_PSCRN=" + std::to_string(1);
+                options << " -D PRESCREEN=prescreenNew";
+                options << " -D USE_OLD_PSCRN=0";
+                options << " -D USE_NEW_PSCRN=1";
             }
-            options += " -D PSCRN_OFFSET=" + std::to_string(pscrn == 1 ? 5 : 6);
-            options += " -D DIMS1=" + std::to_string(dims1);
-            options += " -D NNS=" + std::to_string(nnsTable[nns]);
-            options += " -D NNS2=" + std::to_string(nnsTable[nns] * 2);
-            options += " -D XDIA=" + std::to_string(xdia);
-            options += " -D YDIA=" + std::to_string(ydia);
-            options += " -D ASIZE=" + std::to_string(asize);
-            options += " -D XDIAD2M1=" + std::to_string(xdiad2m1);
-            options += " -D YDIAD2M1=" + std::to_string(ydiad2m1);
-            options += " -D X_OFFSET=" + std::to_string(xOffset);
-            options += " -D INPUT_WIDTH=" + std::to_string(inputWidth);
-            options += " -D INPUT_HEIGHT=" + std::to_string(inputHeight);
-            std::snprintf(buf, 100, "%.20ff", scaleAsize);
-            options += " -D SCALE_ASIZE=" + std::string{ buf };
-            std::snprintf(buf, 100, "%.20ff", scaleQual);
-            options += " -D SCALE_QUAL=" + std::string{ buf };
-            options += " -D PEAK=" + std::to_string(peak);
+            options << " -D PSCRN_OFFSET=" << (pscrn == 1 ? 5 : 6);
+            options << " -D DIMS1=" << dims1;
+            options << " -D NNS=" << nnsTable[nns];
+            options << " -D NNS2=" << (nnsTable[nns] * 2);
+            options << " -D XDIA=" << xdia;
+            options << " -D YDIA=" << ydia;
+            options << " -D ASIZE=" << asize;
+            options << " -D XDIAD2M1=" << xdiad2m1;
+            options << " -D YDIAD2M1=" << ydiad2m1;
+            options << " -D X_OFFSET=" << xOffset;
+            options << " -D INPUT_WIDTH=" << inputWidth;
+            options << " -D INPUT_HEIGHT=" << inputHeight;
+            options << " -D SCALE_ASIZE=" << scaleAsize << "f";
+            options << " -D SCALE_QUAL=" << scaleQual << "f";
+            options << " -D PEAK=" << peak;
             if (!(d->dh || d->dw)) {
-                options += " -D Y_OFFSET=" + std::to_string(ydia - 1);
-                options += " -D Y_STEP=" + std::to_string(2);
-                options += " -D Y_STRIDE=" + std::to_string(32);
+                options << " -D Y_OFFSET=" << (ydia - 1);
+                options << " -D Y_STEP=2";
+                options << " -D Y_STRIDE=32";
             } else {
-                options += " -D Y_OFFSET=" + std::to_string(ydia / 2);
-                options += " -D Y_STEP=" + std::to_string(1);
-                options += " -D Y_STRIDE=" + std::to_string(16);
+                options << " -D Y_OFFSET=" << (ydia / 2);
+                options << " -D Y_STEP=1";
+                options << " -D Y_STRIDE=16";
             }
-            std::setlocale(LC_ALL, "");
-            d->program = compute::program::build_with_source(source, d->ctx, options);
+            program = compute::program::build_with_source(source, context, options.str());
         } catch (const compute::opencl_error & error) {
-            throw error.error_string() + "\n" + d->program.build_log();
+            throw error.error_string() + "\n" + program.build_log();
         }
 
-        if (d->vi.format->bytesPerSample == 1)
-            d->clImageFormat = { CL_R, CL_UNSIGNED_INT8 };
-        else if (d->vi.format->bytesPerSample == 2)
-            d->clImageFormat = { CL_R, CL_UNSIGNED_INT16 };
+        if (d->vi.format->sampleType == stInteger)
+            d->kernel = program.create_kernel("filter_uint");
         else
-            d->clImageFormat = { CL_R, CL_FLOAT };
+            d->kernel = program.create_kernel("filter_float");
+
+        cl_image_format imageFormat;
+        if (d->vi.format->bytesPerSample == 1)
+            imageFormat = { CL_R, CL_UNSIGNED_INT8 };
+        else if (d->vi.format->bytesPerSample == 2)
+            imageFormat = { CL_R, CL_UNSIGNED_INT16 };
+        else
+            imageFormat = { CL_R, CL_FLOAT };
+
+        d->src = compute::image2d{ context,
+                                   static_cast<size_t>(vsapi->getVideoInfo(d->node)->width),
+                                   static_cast<size_t>(vsapi->getVideoInfo(d->node)->height),
+                                   compute::image_format{ imageFormat },
+                                   CL_MEM_READ_ONLY | CL_MEM_HOST_WRITE_ONLY };
+
+        d->dst = compute::image2d{ context,
+                                   static_cast<size_t>(std::max(d->vi.width, d->vi.height)),
+                                   static_cast<size_t>(std::max(d->vi.width, d->vi.height)),
+                                   compute::image_format{ imageFormat },
+                                   CL_MEM_READ_WRITE | CL_MEM_HOST_READ_ONLY };
+
+        d->tmp = (d->dh && d->dw) ? compute::image2d{ context,
+                                                      static_cast<size_t>(std::max(d->vi.width, d->vi.height)),
+                                                      static_cast<size_t>(std::max(d->vi.width, d->vi.height)),
+                                                      compute::image_format{ imageFormat },
+                                                      CL_MEM_READ_WRITE | CL_MEM_HOST_NO_ACCESS }
+                                  : compute::image2d{};
 
         {
             constexpr cl_image_format format = { CL_R, CL_FLOAT };
@@ -683,7 +691,7 @@ void VS_CC nnedi3clCreate(const VSMap *in, VSMap *out, void *userData, VSCore *c
 
             cl_int error = 0;
 
-            cl_mem mem = clCreateImage(d->ctx, 0, &format, &desc, nullptr, &error);
+            cl_mem mem = clCreateImage(context, 0, &format, &desc, nullptr, &error);
             if (!mem)
                 BOOST_THROW_EXCEPTION(compute::opencl_error(error));
 
@@ -703,13 +711,13 @@ void VS_CC nnedi3clCreate(const VSMap *in, VSMap *out, void *userData, VSCore *c
         return;
     }
 
-    vsapi->createFilter(in, out, "NNEDI3CL", nnedi3clInit, nnedi3clGetFrame, nnedi3clFree, fmParallel, 0, d.release(), core);
+    vsapi->createFilter(in, out, "NNEDI3CL", nnedi3clInit, nnedi3clGetFrame, nnedi3clFree, fmParallelRequests, 0, d.release(), core);
 }
 
 //////////////////////////////////////////
 // Init
 
-VS_EXTERNAL_API(void) VapourSynthPluginInit(VSConfigPlugin configFunc, VSRegisterFunction registerFunc, VSPlugin *plugin) {
+VS_EXTERNAL_API(void) VapourSynthPluginInit(VSConfigPlugin configFunc, VSRegisterFunction registerFunc, VSPlugin * plugin) {
     configFunc("com.holywu.nnedi3cl", "nnedi3cl", "An intra-field only deinterlacer", VAPOURSYNTH_API_VERSION, 1, plugin);
     registerFunc("NNEDI3CL",
                  "clip:clip;"
