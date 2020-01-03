@@ -24,18 +24,19 @@
 **   Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
 */
 
-#include <clocale>
-#include <cstdio>
+#include <locale>
 #include <memory>
+#include <sstream>
 #include <string>
 
 #include "EEDI3CL.hpp"
 #include "EEDI3CL.cl"
 
-template<typename T> extern void processCL_sse2(const VSFrameRef *, const VSFrameRef *, VSFrameRef *, VSFrameRef **, const int, const EEDI3CLData *, const VSAPI *);
+template<typename T> extern void filterCL_sse2(const VSFrameRef *, const VSFrameRef *, VSFrameRef *, VSFrameRef **, const int, const EEDI3CLData * const VS_RESTRICT, const VSAPI *);
 
 template<typename T>
-static void processCL_c(const VSFrameRef * src, const VSFrameRef * scp, VSFrameRef * dst, VSFrameRef ** pad, const int field_n, const EEDI3CLData * d, const VSAPI * vsapi) {
+static void filterCL_c(const VSFrameRef * src, const VSFrameRef * scp, VSFrameRef * dst, VSFrameRef ** pad,
+                       const int field_n, const EEDI3CLData * const VS_RESTRICT d, const VSAPI * vsapi) {
     for (int plane = 0; plane < d->vi.format->numPlanes; plane++) {
         if (d->process[plane]) {
             copyPad<T>(src, pad[plane], plane, 1 - field_n, d->dh, vsapi);
@@ -58,7 +59,7 @@ static void processCL_c(const VSFrameRef * src, const VSFrameRef * scp, VSFrameR
             int * pbackt = d->pbackt.at(threadId) + d->mdis;
             int * fpath = d->fpath.at(threadId);
             int * _dmap = d->dmap.at(threadId);
-            float * tline = d->tline.at(threadId);
+            int * tline = d->tline.at(threadId);
 
             const size_t globalWorkSize[] = { static_cast<size_t>((dstWidth + 63) & -64), 1 };
             constexpr size_t localWorkSize[] = { 64, 1 };
@@ -96,7 +97,6 @@ static void processCL_c(const VSFrameRef * src, const VSFrameRef * scp, VSFrameR
 
                     const int umax = std::min({ x, dstWidth - 1 - x, d->mdis });
                     const int umax2 = std::min({ x - 1, dstWidth - x, d->mdis });
-
                     for (int u = -umax; u <= umax; u++) {
                         int idx = 0;
                         float bval = FLT_MAX;
@@ -121,7 +121,7 @@ static void processCL_c(const VSFrameRef * src, const VSFrameRef * scp, VSFrameR
                 for (int x = dstWidth - 2; x >= 0; x--)
                     fpath[x] = pbackt[d->tpitch * x + fpath[x + 1]];
 
-                interpolate<T>(src3p, src1p, src1n, src3n, fpath, dmap, dstp, dstWidth, d->ucubic, d->peak);
+                interpolate<T>(src3p, src1p, src1n, src3n, nullptr, fpath, dmap, dstp, dstWidth, d->ucubic, d->peak);
 
                 queue.enqueue_unmap_buffer(_ccosts, ccosts - d->mdis);
             }
@@ -131,7 +131,7 @@ static void processCL_c(const VSFrameRef * src, const VSFrameRef * scp, VSFrameR
                 const T * scpp = nullptr;
                 if (d->sclip)
                     scpp = reinterpret_cast<const T *>(vsapi->getReadPtr(scp, plane)) + dstStride * field_n;
-                T * dstp = _dstp + dstStride * field_n;;
+                T * dstp = _dstp + dstStride * field_n;
 
                 vCheck<T>(srcp, scpp, dstp, _dmap, tline, field_n, dstWidth, srcHeight, srcStride, dstStride, d->vcheck, d->vthresh2, d->rcpVthresh0, d->rcpVthresh1, d->rcpVthresh2, d->peak);
             }
@@ -148,29 +148,29 @@ static void selectFunctions(const unsigned opt, EEDI3CLData * d) noexcept {
         d->vectorSize = 4;
 
     if (d->vi.format->bytesPerSample == 1) {
-        d->processor = processCL_c<uint8_t>;
+        d->filter = filterCL_c<uint8_t>;
 
         if ((opt == 0 && iset >= 2) || opt == 2)
-            d->processor = processCL_sse2<uint8_t>;
+            d->filter = filterCL_sse2<uint8_t>;
     } else if (d->vi.format->bytesPerSample == 2) {
-        d->processor = processCL_c<uint16_t>;
+        d->filter = filterCL_c<uint16_t>;
 
         if ((opt == 0 && iset >= 2) || opt == 2)
-            d->processor = processCL_sse2<uint16_t>;
+            d->filter = filterCL_sse2<uint16_t>;
     } else {
-        d->processor = processCL_c<float>;
+        d->filter = filterCL_c<float>;
 
         if ((opt == 0 && iset >= 2) || opt == 2)
-            d->processor = processCL_sse2<float>;
+            d->filter = filterCL_sse2<float>;
     }
 }
 
-static void VS_CC eedi3clInit(VSMap *in, VSMap *out, void **instanceData, VSNode *node, VSCore *core, const VSAPI *vsapi) {
+static void VS_CC eedi3clInit(VSMap * in, VSMap * out, void ** instanceData, VSNode * node, VSCore * core, const VSAPI * vsapi) {
     EEDI3CLData * d = static_cast<EEDI3CLData *>(*instanceData);
     vsapi->setVideoInfo(&d->vi, 1, node);
 }
 
-static const VSFrameRef *VS_CC eedi3clGetFrame(int n, int activationReason, void **instanceData, void **frameData, VSFrameContext *frameCtx, VSCore *core, const VSAPI *vsapi) {
+static const VSFrameRef * VS_CC eedi3clGetFrame(int n, int activationReason, void ** instanceData, void ** frameData, VSFrameContext * frameCtx, VSCore * core, const VSAPI * vsapi) {
     EEDI3CLData * d = static_cast<EEDI3CLData *>(*instanceData);
 
     if (activationReason == arInitial) {
@@ -184,53 +184,40 @@ static const VSFrameRef *VS_CC eedi3clGetFrame(int n, int activationReason, void
         try {
             auto threadId = std::this_thread::get_id();
 
-            if (!d->queue.count(threadId))
-                d->queue.emplace(threadId, compute::command_queue{ d->ctx, d->gpu });
+            if (!d->queue.count(threadId)) {
+                d->queue.emplace(threadId, compute::command_queue{ d->context, d->device });
 
-            if (!d->calculateConnectionCosts.count(threadId)) {
                 if (d->vi.format->sampleType == stInteger)
                     d->calculateConnectionCosts.emplace(threadId, d->program.create_kernel("calculateConnectionCosts_uint"));
                 else
                     d->calculateConnectionCosts.emplace(threadId, d->program.create_kernel("calculateConnectionCosts_float"));
-            }
 
-            if (!d->src.count(threadId))
-                d->src.emplace(threadId, compute::image2d{ d->ctx, d->vi.width + 24U, d->vi.height + 8U, compute::image_format{ d->clImageFormat }, CL_MEM_READ_ONLY | CL_MEM_HOST_WRITE_ONLY });
+                d->src.emplace(threadId, compute::image2d{ d->context, d->vi.width + 24U, d->vi.height + 8U, compute::image_format{ d->clImageFormat }, CL_MEM_READ_ONLY | CL_MEM_HOST_WRITE_ONLY });
 
-            if (!d->ccosts.count(threadId))
-                d->ccosts.emplace(threadId, compute::buffer{ d->ctx, d->vi.width * d->tpitchVector * sizeof(cl_float), CL_MEM_WRITE_ONLY | CL_MEM_ALLOC_HOST_PTR | CL_MEM_HOST_READ_ONLY });
+                d->ccosts.emplace(threadId, compute::buffer{ d->context, d->vi.width * d->tpitchVector * sizeof(cl_float), CL_MEM_WRITE_ONLY | CL_MEM_ALLOC_HOST_PTR | CL_MEM_HOST_READ_ONLY });
 
-            if (!d->pcosts.count(threadId)) {
                 float * pcosts = vs_aligned_malloc<float>(d->vi.width * d->tpitchVector * sizeof(float), 16);
                 if (!pcosts)
                     throw std::string{ "malloc failure (pcosts)" };
                 d->pcosts.emplace(threadId, pcosts);
-            }
 
-            if (!d->pbackt.count(threadId)) {
                 int * pbackt = vs_aligned_malloc<int>(d->vi.width * d->tpitchVector * sizeof(int), 16);
                 if (!pbackt)
                     throw std::string{ "malloc failure (pbackt)" };
                 d->pbackt.emplace(threadId, pbackt);
-            }
 
-            if (!d->fpath.count(threadId)) {
                 int * fpath = new (std::nothrow) int[d->vi.width * d->vectorSize];
                 if (!fpath)
                     throw std::string{ "malloc failure (fpath)" };
                 d->fpath.emplace(threadId, fpath);
-            }
 
-            if (!d->dmap.count(threadId)) {
                 int * dmap = new (std::nothrow) int[d->vi.width * d->vi.height];
                 if (!dmap)
                     throw std::string{ "malloc failure (dmap)" };
                 d->dmap.emplace(threadId, dmap);
-            }
 
-            if (!d->tline.count(threadId)) {
                 if (d->vcheck) {
-                    float * tline = new (std::nothrow) float[d->vi.width];
+                    int * tline = new (std::nothrow) int[d->vi.width];
                     if (!tline)
                         throw std::string{ "malloc failure (tline)" };
                     d->tline.emplace(threadId, tline);
@@ -247,9 +234,7 @@ static const VSFrameRef *VS_CC eedi3clGetFrame(int n, int activationReason, void
         }
 
         const VSFrameRef * src = vsapi->getFrameFilter(d->field > 1 ? n / 2 : n, d->node, frameCtx);
-        const VSFrameRef * fr[] = { d->process[0] ? nullptr : src, d->process[1] ? nullptr : src, d->process[2] ? nullptr : src };
-        const int pl[] = { 0, 1, 2 };
-        VSFrameRef * dst = vsapi->newVideoFrame2(d->vi.format, d->vi.width, d->vi.height, fr, pl, src, core);
+        VSFrameRef * dst = vsapi->newVideoFrame(d->vi.format, d->vi.width, d->vi.height, src, core);
 
         const VSFrameRef * scp = nullptr;
         if (d->vcheck && d->sclip)
@@ -286,7 +271,7 @@ static const VSFrameRef *VS_CC eedi3clGetFrame(int n, int activationReason, void
         }
 
         try {
-            d->processor(src, scp, dst, pad, field_n, d, vsapi);
+            d->filter(src, scp, dst, pad, field_n, d, vsapi);
         } catch (const compute::opencl_error & error) {
             vsapi->setFilterError(("EEDI3CL: " + error.error_string()).c_str(), frameCtx);
             vsapi->freeFrame(src);
@@ -322,7 +307,7 @@ static const VSFrameRef *VS_CC eedi3clGetFrame(int n, int activationReason, void
     return nullptr;
 }
 
-static void VS_CC eedi3clFree(void *instanceData, VSCore *core, const VSAPI *vsapi) {
+static void VS_CC eedi3clFree(void * instanceData, VSCore * core, const VSAPI * vsapi) {
     EEDI3CLData * d = static_cast<EEDI3CLData *>(instanceData);
 
     vsapi->freeNode(d->node);
@@ -346,8 +331,8 @@ static void VS_CC eedi3clFree(void *instanceData, VSCore *core, const VSAPI *vsa
     delete d;
 }
 
-void VS_CC eedi3clCreate(const VSMap *in, VSMap *out, void *userData, VSCore *core, const VSAPI *vsapi) {
-    std::unique_ptr<EEDI3CLData> d{ new EEDI3CLData{} };
+void VS_CC eedi3clCreate(const VSMap * in, VSMap * out, void * userData, VSCore * core, const VSAPI * vsapi) {
+    std::unique_ptr<EEDI3CLData> d = std::make_unique<EEDI3CLData>();
     int err;
 
     d->node = vsapi->propGetNode(in, "clip", 0, nullptr);
@@ -355,7 +340,8 @@ void VS_CC eedi3clCreate(const VSMap *in, VSMap *out, void *userData, VSCore *co
     d->vi = *vsapi->getVideoInfo(d->node);
 
     try {
-        if (!isConstantFormat(&d->vi) || (d->vi.format->sampleType == stInteger && d->vi.format->bitsPerSample > 16) ||
+        if (!isConstantFormat(&d->vi) ||
+            (d->vi.format->sampleType == stInteger && d->vi.format->bitsPerSample > 16) ||
             (d->vi.format->sampleType == stFloat && d->vi.format->bitsPerSample != 32))
             throw std::string{ "only constant format 8-16 bit integer and 32 bit float input supported" };
 
@@ -390,7 +376,7 @@ void VS_CC eedi3clCreate(const VSMap *in, VSMap *out, void *userData, VSCore *co
 
         d->gamma = static_cast<float>(vsapi->propGetFloat(in, "gamma", 0, &err));
         if (err)
-            d->gamma = 20.f;
+            d->gamma = 20.0f;
 
         int nrad = int64ToIntS(vsapi->propGetInt(in, "nrad", 0, &err));
         if (err)
@@ -414,15 +400,15 @@ void VS_CC eedi3clCreate(const VSMap *in, VSMap *out, void *userData, VSCore *co
 
         float vthresh0 = static_cast<float>(vsapi->propGetFloat(in, "vthresh0", 0, &err));
         if (err)
-            vthresh0 = 32.f;
+            vthresh0 = 32.0f;
 
         float vthresh1 = static_cast<float>(vsapi->propGetFloat(in, "vthresh1", 0, &err));
         if (err)
-            vthresh1 = 64.f;
+            vthresh1 = 64.0f;
 
         d->vthresh2 = static_cast<float>(vsapi->propGetFloat(in, "vthresh2", 0, &err));
         if (err)
-            d->vthresh2 = 4.f;
+            d->vthresh2 = 4.0f;
 
         const int opt = int64ToIntS(vsapi->propGetInt(in, "opt", 0, &err));
 
@@ -431,7 +417,7 @@ void VS_CC eedi3clCreate(const VSMap *in, VSMap *out, void *userData, VSCore *co
             device = -1;
 
         if (d->field < 0 || d->field > 3)
-            throw std::string{ "field must be 0, 1, 2 or 3" };
+            throw std::string{ "field must be 0, 1, 2, or 3" };
 
         if (!d->dh && (d->vi.height & 1))
             throw std::string{ "height must be mod 2 when dh=False" };
@@ -439,16 +425,16 @@ void VS_CC eedi3clCreate(const VSMap *in, VSMap *out, void *userData, VSCore *co
         if (d->dh && d->field > 1)
             throw std::string{ "field must be 0 or 1 when dh=True" };
 
-        if (alpha < 0.f || alpha > 1.f)
+        if (alpha < 0.0f || alpha > 1.0f)
             throw std::string{ "alpha must be between 0.0 and 1.0 (inclusive)" };
 
-        if (beta < 0.f || beta > 1.f)
+        if (beta < 0.0f || beta > 1.0f)
             throw std::string{ "beta must be between 0.0 and 1.0 (inclusive)" };
 
-        if (alpha + beta > 1.f)
+        if (alpha + beta > 1.0f)
             throw std::string{ "alpha+beta must be between 0.0 and 1.0 (inclusive)" };
 
-        if (d->gamma < 0.f)
+        if (d->gamma < 0.0f)
             throw std::string{ "gamma must be greater than or equal to 0.0" };
 
         if (nrad < 0 || nrad > 3)
@@ -458,13 +444,13 @@ void VS_CC eedi3clCreate(const VSMap *in, VSMap *out, void *userData, VSCore *co
             throw std::string{ "mdis must be between 1 and 40 (inclusive)" };
 
         if (d->vcheck < 0 || d->vcheck > 3)
-            throw std::string{ "vcheck must be 0, 1, 2 or 3" };
+            throw std::string{ "vcheck must be 0, 1, 2, or 3" };
 
-        if (d->vcheck && (vthresh0 <= 0.f || vthresh1 <= 0.f || d->vthresh2 <= 0.f))
-            throw std::string{ "vthresh0, vthresh1 and vthresh2 must be greater than 0.0" };
+        if (d->vcheck && (vthresh0 <= 0.0f || vthresh1 <= 0.0f || d->vthresh2 <= 0.0f))
+            throw std::string{ "vthresh0, vthresh1, and vthresh2 must be greater than 0.0" };
 
         if (opt < 0 || opt > 2)
-            throw std::string{ "opt must be 0, 1 or 2" };
+            throw std::string{ "opt must be 0, 1, or 2" };
 
         if (device >= static_cast<int>(compute::system::device_count()))
             throw std::string{ "device index out of range" };
@@ -499,90 +485,53 @@ void VS_CC eedi3clCreate(const VSMap *in, VSMap *out, void *userData, VSCore *co
             return;
         }
 
-        if (d->field > 1) {
-            if (d->vi.numFrames > INT_MAX / 2)
-                throw std::string{ "resulting clip is too long" };
-            d->vi.numFrames *= 2;
-
-            muldivRational(&d->vi.fpsNum, &d->vi.fpsDen, 2, 1);
-        }
-
-        if (d->dh)
-            d->vi.height *= 2;
-
-        const float remainingWeight = 1.f - alpha - beta;
-
-        if (cost3)
-            alpha /= 3.f;
-
-        if (d->vcheck && d->sclip) {
-            if (!isSameFormat(vsapi->getVideoInfo(d->sclip), &d->vi))
-                throw std::string{ "sclip must have the same dimensions as main clip and be the same format" };
-
-            if (vsapi->getVideoInfo(d->sclip)->numFrames != d->vi.numFrames)
-                throw std::string{ "sclip's number of frames doesn't match" };
-        }
-
-        const unsigned numThreads = vsapi->getCoreInfo(core)->numThreads;
-        d->queue.reserve(numThreads);
-        d->calculateConnectionCosts.reserve(numThreads);
-        d->src.reserve(numThreads);
-        d->ccosts.reserve(numThreads);
-        d->pcosts.reserve(numThreads);
-        d->pbackt.reserve(numThreads);
-        d->fpath.reserve(numThreads);
-        d->dmap.reserve(numThreads);
-        d->tline.reserve(numThreads);
-
-        if (d->vi.format->sampleType == stInteger) {
-            d->peak = (1 << d->vi.format->bitsPerSample) - 1;
-            const float scale = d->peak / 255.f;
-            beta *= scale;
-            d->gamma *= scale;
-            vthresh0 *= scale;
-            vthresh1 *= scale;
-        } else {
-            beta /= 255.f;
-            d->gamma /= 255.f;
-            vthresh0 /= 255.f;
-            vthresh1 /= 255.f;
-        }
-
-        selectFunctions(opt, d.get());
-
-        d->tpitch = d->mdis * 2 + 1;
-        d->mdisVector = d->mdis * d->vectorSize;
-        d->tpitchVector = d->tpitch * d->vectorSize;
-
-        d->rcpVthresh0 = 1.f / vthresh0;
-        d->rcpVthresh1 = 1.f / vthresh1;
-        d->rcpVthresh2 = 1.f / d->vthresh2;
-
-        d->gpu = compute::system::default_device();
+        d->device = compute::system::default_device();
         if (device > -1)
-            d->gpu = compute::system::devices().at(device);
-        d->ctx = compute::context{ d->gpu };
+            d->device = compute::system::devices().at(device);
+        d->context = compute::context{ d->device };
 
         if (!!vsapi->propGetInt(in, "info", 0, &err)) {
             vsapi->freeNode(d->sclip);
 
-            std::string text{ "=== Device Info ===\n" };
-            text += "Name: " + d->gpu.get_info<CL_DEVICE_NAME>() + "\n";
-            text += "Vendor: " + d->gpu.get_info<CL_DEVICE_VENDOR>() + "\n";
-            text += "Profile: " + d->gpu.get_info<CL_DEVICE_PROFILE>() + "\n";
-            text += "Version: " + d->gpu.get_info<CL_DEVICE_VERSION>() + "\n";
-            text += "Global Memory Size: " + std::to_string(d->gpu.get_info<CL_DEVICE_GLOBAL_MEM_SIZE>() / 1024 / 1024) + " MB\n";
-            text += "Local Memory Size: " + std::to_string(d->gpu.get_info<CL_DEVICE_LOCAL_MEM_SIZE>() / 1024) + " KB\n";
-            text += "Local Memory Type: " + std::string{ d->gpu.get_info<CL_DEVICE_LOCAL_MEM_TYPE>() == CL_LOCAL ? "CL_LOCAL" : "CL_GLOBAL" } +"\n";
-            text += "Image Support: " + std::string{ d->gpu.get_info<CL_DEVICE_IMAGE_SUPPORT>() ? "CL_TRUE" : "CL_FALSE" } +"\n";
-            text += "1D Image Max Buffer Size: " + std::to_string(d->gpu.get_info<size_t>(CL_DEVICE_IMAGE_MAX_BUFFER_SIZE)) + "\n";
-            text += "2D Image Max Width: " + std::to_string(d->gpu.get_info<CL_DEVICE_IMAGE2D_MAX_WIDTH>()) + "\n";
-            text += "2D Image Max Height: " + std::to_string(d->gpu.get_info<CL_DEVICE_IMAGE2D_MAX_HEIGHT>()) + "\n";
-            text += "Max Constant Arguments: " + std::to_string(d->gpu.get_info<CL_DEVICE_MAX_CONSTANT_ARGS>()) + "\n";
-            text += "Max Constant Buffer Size: " + std::to_string(d->gpu.get_info<CL_DEVICE_MAX_CONSTANT_BUFFER_SIZE>() / 1024) + " KB\n";
-            text += "Max Work-group Size: " + std::to_string(d->gpu.get_info<CL_DEVICE_MAX_WORK_GROUP_SIZE>()) + "\n";
-            const auto MAX_WORK_ITEM_SIZES = d->gpu.get_info<CL_DEVICE_MAX_WORK_ITEM_SIZES>();
-            text += "Max Work-item Sizes: (" + std::to_string(MAX_WORK_ITEM_SIZES[0]) + ", " + std::to_string(MAX_WORK_ITEM_SIZES[1]) + ", " + std::to_string(MAX_WORK_ITEM_SIZES[2]) + ")";
+            std::string text{ "=== Platform Info ===\n" };
+            const auto platform = d->device.platform();
+            text += "Profile: " + platform.get_info<CL_PLATFORM_PROFILE>() + "\n";
+            text += "Version: " + platform.get_info<CL_PLATFORM_VERSION>() + "\n";
+            text += "Name: " + platform.get_info<CL_PLATFORM_NAME>() + "\n";
+            text += "Vendor: " + platform.get_info<CL_PLATFORM_VENDOR>() + "\n";
+
+            text += "\n";
+
+            text += "=== Device Info ===\n";
+            text += "Name: " + d->device.get_info<CL_DEVICE_NAME>() + "\n";
+            text += "Vendor: " + d->device.get_info<CL_DEVICE_VENDOR>() + "\n";
+            text += "Profile: " + d->device.get_info<CL_DEVICE_PROFILE>() + "\n";
+            text += "Version: " + d->device.get_info<CL_DEVICE_VERSION>() + "\n";
+            text += "Max compute units: " + std::to_string(d->device.get_info<CL_DEVICE_MAX_COMPUTE_UNITS>()) + "\n";
+            text += "Max work-group size: " + std::to_string(d->device.get_info<CL_DEVICE_MAX_WORK_GROUP_SIZE>()) + "\n";
+            const auto max_work_item_sizes = d->device.get_info<CL_DEVICE_MAX_WORK_ITEM_SIZES>();
+            text += "Max work-item sizes: " + std::to_string(max_work_item_sizes[0]) + ", " + std::to_string(max_work_item_sizes[1]) + ", " + std::to_string(max_work_item_sizes[2]) + "\n";
+            text += "2D image max width: " + std::to_string(d->device.get_info<CL_DEVICE_IMAGE2D_MAX_WIDTH>()) + "\n";
+            text += "2D image max height: " + std::to_string(d->device.get_info<CL_DEVICE_IMAGE2D_MAX_HEIGHT>()) + "\n";
+            text += "Image support: " + std::string{ d->device.get_info<CL_DEVICE_IMAGE_SUPPORT>() ? "CL_TRUE" : "CL_FALSE" } +"\n";
+            const auto global_mem_cache_type = d->device.get_info<CL_DEVICE_GLOBAL_MEM_CACHE_TYPE>();
+            if (global_mem_cache_type == CL_NONE)
+                text += "Global memory cache type: CL_NONE\n";
+            else if (global_mem_cache_type == CL_READ_ONLY_CACHE)
+                text += "Global memory cache type: CL_READ_ONLY_CACHE\n";
+            else if (global_mem_cache_type == CL_READ_WRITE_CACHE)
+                text += "Global memory cache type: CL_READ_WRITE_CACHE\n";
+            text += "Global memory cache size: " + std::to_string(d->device.get_info<CL_DEVICE_GLOBAL_MEM_CACHE_SIZE>() / 1024) + " KB\n";
+            text += "Global memory size: " + std::to_string(d->device.get_info<CL_DEVICE_GLOBAL_MEM_SIZE>() / (1024 * 1024)) + " MB\n";
+            text += "Max constant buffer size: " + std::to_string(d->device.get_info<CL_DEVICE_MAX_CONSTANT_BUFFER_SIZE>() / 1024) + " KB\n";
+            text += "Max constant arguments: " + std::to_string(d->device.get_info<CL_DEVICE_MAX_CONSTANT_ARGS>()) + "\n";
+            text += "Local memory type: " + std::string{ d->device.get_info<CL_DEVICE_LOCAL_MEM_TYPE>() == CL_LOCAL ? "CL_LOCAL" : "CL_GLOBAL" } +"\n";
+            text += "Local memory size: " + std::to_string(d->device.get_info<CL_DEVICE_LOCAL_MEM_SIZE>() / 1024) + " KB\n";
+            text += "Available: " + std::string{ d->device.get_info<CL_DEVICE_AVAILABLE>() ? "CL_TRUE" : "CL_FALSE" } +"\n";
+            text += "Compiler available: " + std::string{ d->device.get_info<CL_DEVICE_COMPILER_AVAILABLE>() ? "CL_TRUE" : "CL_FALSE" } +"\n";
+            text += "OpenCL C version: " + d->device.get_info<CL_DEVICE_OPENCL_C_VERSION>() + "\n";
+            text += "Linker available: " + std::string{ d->device.get_info<CL_DEVICE_LINKER_AVAILABLE>() ? "CL_TRUE" : "CL_FALSE" } +"\n";
+            text += "Image max buffer size: " + std::to_string(d->device.get_info<size_t>(CL_DEVICE_IMAGE_MAX_BUFFER_SIZE) / 1024) + " KB";
 
             VSMap * args = vsapi->createMap();
             vsapi->propSetNode(args, "clip", d->node, paReplace);
@@ -605,30 +554,64 @@ void VS_CC eedi3clCreate(const VSMap *in, VSMap *out, void *userData, VSCore *co
             return;
         }
 
-        try {
-            std::setlocale(LC_ALL, "C");
-            char buf[100];
-            std::string options{ "-cl-denorms-are-zero -cl-fast-relaxed-math -Werror" };
-            std::snprintf(buf, 100, "%.20ff", alpha);
-            options += " -D ALPHA=" + std::string{ buf };
-            std::snprintf(buf, 100, "%.20ff", beta);
-            options += " -D BETA=" + std::string{ buf };
-            options += " -D NRAD=" + std::to_string(nrad);
-            options += " -D MDIS=" + std::to_string(d->mdis);
-            options += " -D COST3=" + std::to_string(cost3);
-            std::snprintf(buf, 100, "%.20ff", remainingWeight);
-            options += " -D REMAINING_WEIGHT=" + std::string{ buf };
-            options += " -D TPITCH=" + std::to_string(d->tpitch);
-            options += " -D VECTOR_SIZE=" + std::to_string(d->vectorSize);
-            options += " -D MDIS_VECTOR=" + std::to_string(d->mdisVector);
-            options += " -D TPITCH_VECTOR=" + std::to_string(d->tpitchVector);
-            options += " -D LOCAL_WORK_SIZE_X=" + std::to_string(64 / d->vectorSize);
-            options += " -D LOCAL_WORK_SIZE_Y=" + std::to_string(d->vectorSize);
-            std::setlocale(LC_ALL, "");
-            d->program = compute::program::build_with_source(source, d->ctx, options);
-        } catch (const compute::opencl_error & error) {
-            throw error.error_string() + "\n" + d->program.build_log();
+        if (d->field > 1) {
+            if (d->vi.numFrames > INT_MAX / 2)
+                throw std::string{ "resulting clip is too long" };
+            d->vi.numFrames *= 2;
+
+            muldivRational(&d->vi.fpsNum, &d->vi.fpsDen, 2, 1);
         }
+
+        if (d->dh)
+            d->vi.height *= 2;
+
+        const float remainingWeight = 1.0f - alpha - beta;
+
+        if (cost3)
+            alpha /= 3.0f;
+
+        if (d->vcheck && d->sclip) {
+            if (!isSameFormat(vsapi->getVideoInfo(d->sclip), &d->vi))
+                throw std::string{ "sclip's format doesn't match" };
+
+            if (vsapi->getVideoInfo(d->sclip)->numFrames != d->vi.numFrames)
+                throw std::string{ "sclip's number of frames doesn't match" };
+        }
+
+        const unsigned numThreads = vsapi->getCoreInfo(core)->numThreads;
+        d->queue.reserve(numThreads);
+        d->calculateConnectionCosts.reserve(numThreads);
+        d->src.reserve(numThreads);
+        d->ccosts.reserve(numThreads);
+        d->pcosts.reserve(numThreads);
+        d->pbackt.reserve(numThreads);
+        d->fpath.reserve(numThreads);
+        d->dmap.reserve(numThreads);
+        d->tline.reserve(numThreads);
+
+        selectFunctions(opt, d.get());
+
+        if (d->vi.format->sampleType == stInteger) {
+            d->peak = (1 << d->vi.format->bitsPerSample) - 1;
+            const float scale = d->peak / 255.0f;
+            beta *= scale;
+            d->gamma *= scale;
+            vthresh0 *= scale;
+            vthresh1 *= scale;
+        } else {
+            beta /= 255.0f;
+            d->gamma /= 255.0f;
+            vthresh0 /= 255.0f;
+            vthresh1 /= 255.0f;
+        }
+
+        d->tpitch = d->mdis * 2 + 1;
+        d->tpitchVector = d->tpitch * d->vectorSize;
+        d->mdisVector = d->mdis * d->vectorSize;
+
+        d->rcpVthresh0 = 1.0f / vthresh0;
+        d->rcpVthresh1 = 1.0f / vthresh1;
+        d->rcpVthresh2 = 1.0f / d->vthresh2;
 
         if (d->vi.format->bytesPerSample == 1)
             d->clImageFormat = { CL_R, CL_UNSIGNED_INT8 };
@@ -636,6 +619,29 @@ void VS_CC eedi3clCreate(const VSMap *in, VSMap *out, void *userData, VSCore *co
             d->clImageFormat = { CL_R, CL_UNSIGNED_INT16 };
         else
             d->clImageFormat = { CL_R, CL_FLOAT };
+
+        try {
+            std::ostringstream options;
+            options.imbue(std::locale{ "C" });
+            options.precision(16);
+            options.setf(std::ios::fixed, std::ios::floatfield);
+            options << "-cl-denorms-are-zero -cl-fast-relaxed-math -Werror";
+            options << " -D ALPHA=" << alpha << "f";
+            options << " -D BETA=" << beta << "f";
+            options << " -D NRAD=" << nrad;
+            options << " -D MDIS=" << d->mdis;
+            options << " -D COST3=" << cost3;
+            options << " -D REMAINING_WEIGHT=" << remainingWeight << "f";
+            options << " -D TPITCH=" << d->tpitch;
+            options << " -D VECTOR_SIZE=" << d->vectorSize;
+            options << " -D MDIS_VECTOR=" << d->mdisVector;
+            options << " -D TPITCH_VECTOR=" << d->tpitchVector;
+            options << " -D LOCAL_WORK_SIZE_X=" << (64 / d->vectorSize);
+            options << " -D LOCAL_WORK_SIZE_Y=" << d->vectorSize;
+            d->program = compute::program::build_with_source(source, d->context, options.str());
+        } catch (const compute::opencl_error & error) {
+            throw error.error_string() + "\n" + d->program.build_log();
+        }
     } catch (const std::string & error) {
         vsapi->setError(out, ("EEDI3CL: " + error).c_str());
         vsapi->freeNode(d->node);

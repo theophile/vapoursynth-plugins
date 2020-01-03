@@ -29,134 +29,139 @@
 #include "EEDI3.hpp"
 
 #ifdef VS_TARGET_CPU_X86
-template<typename T1, typename T2> extern void process_sse2(const VSFrameRef *, const VSFrameRef *, VSFrameRef *, VSFrameRef **, const int, const EEDI3Data *, const VSAPI *) noexcept;
-template<typename T1, typename T2> extern void process_sse4(const VSFrameRef *, const VSFrameRef *, VSFrameRef *, VSFrameRef **, const int, const EEDI3Data *, const VSAPI *) noexcept;
-template<typename T1, typename T2> extern void process_avx(const VSFrameRef *, const VSFrameRef *, VSFrameRef *, VSFrameRef **, const int, const EEDI3Data *, const VSAPI *) noexcept;
-template<typename T1, typename T2> extern void process_avx512(const VSFrameRef *, const VSFrameRef *, VSFrameRef *, VSFrameRef **, const int, const EEDI3Data *, const VSAPI *) noexcept;
+template<typename T1, typename T2> extern void filter_sse2(const VSFrameRef *, const VSFrameRef *, const VSFrameRef *, VSFrameRef *, VSFrameRef *, VSFrameRef **, const int, const EEDI3Data * const VS_RESTRICT, const VSAPI *) noexcept;
+template<typename T1, typename T2> extern void filter_sse4(const VSFrameRef *, const VSFrameRef *, const VSFrameRef *, VSFrameRef *, VSFrameRef *, VSFrameRef **, const int, const EEDI3Data * const VS_RESTRICT, const VSAPI *) noexcept;
+template<typename T1, typename T2> extern void filter_avx(const VSFrameRef *, const VSFrameRef *, const VSFrameRef *, VSFrameRef *, VSFrameRef *, VSFrameRef **, const int, const EEDI3Data * const VS_RESTRICT, const VSAPI *) noexcept;
+template<typename T1, typename T2> extern void filter_avx512(const VSFrameRef *, const VSFrameRef *, const VSFrameRef *, VSFrameRef *, VSFrameRef *, VSFrameRef **, const int, const EEDI3Data * const VS_RESTRICT, const VSAPI *) noexcept;
 #endif
 
 template<typename T>
-static inline void calculateConnectionCosts(const T * src3p, const T * src1p, const T * src1n, const T * src3n, float * VS_RESTRICT ccosts,
-                                            const int width, const EEDI3Data * d) noexcept {
+static inline void calculateConnectionCosts(const T * src3p, const T * src1p, const T * src1n, const T * src3n, const bool * bmask, float * VS_RESTRICT ccosts,
+                                            const int width, const EEDI3Data * const VS_RESTRICT d) noexcept {
     if (d->cost3) {
         for (int x = 0; x < width; x++) {
-            const int umax = std::min({ x, width - 1 - x, d->mdis });
+            if (!bmask || bmask[x]) {
+                const int umax = std::min({ x, width - 1 - x, d->mdis });
+                for (int u = -umax; u <= umax; u++) {
+                    const int u2 = u * 2;
+                    int s0 = 0, s1 = -1, s2 = -1;
 
-            for (int u = -umax; u <= umax; u++) {
-                const int u2 = u * 2;
-                int s0 = 0, s1 = -1, s2 = -1;
-
-                for (int k = -(d->nrad); k <= d->nrad; k++)
-                    s0 += std::abs(src3p[x + u + k] - src1p[x - u + k]) +
-                          std::abs(src1p[x + u + k] - src1n[x - u + k]) +
-                          std::abs(src1n[x + u + k] - src3n[x - u + k]);
-
-                if ((u >= 0 && x >= u2) || (u <= 0 && x < width + u2)) {
-                    s1 = 0;
                     for (int k = -(d->nrad); k <= d->nrad; k++)
-                        s1 += std::abs(src3p[x + k] - src1p[x - u2 + k]) +
-                              std::abs(src1p[x + k] - src1n[x - u2 + k]) +
-                              std::abs(src1n[x + k] - src3n[x - u2 + k]);
+                        s0 += std::abs(src3p[x + u + k] - src1p[x - u + k]) +
+                              std::abs(src1p[x + u + k] - src1n[x - u + k]) +
+                              std::abs(src1n[x + u + k] - src3n[x - u + k]);
+
+                    if ((u >= 0 && x >= u2) || (u <= 0 && x < width + u2)) {
+                        s1 = 0;
+                        for (int k = -(d->nrad); k <= d->nrad; k++)
+                            s1 += std::abs(src3p[x + k] - src1p[x - u2 + k]) +
+                                  std::abs(src1p[x + k] - src1n[x - u2 + k]) +
+                                  std::abs(src1n[x + k] - src3n[x - u2 + k]);
+                    }
+
+                    if ((u <= 0 && x >= -u2) || (u >= 0 && x < width - u2)) {
+                        s2 = 0;
+                        for (int k = -(d->nrad); k <= d->nrad; k++)
+                            s2 += std::abs(src3p[x + u2 + k] - src1p[x + k]) +
+                                  std::abs(src1p[x + u2 + k] - src1n[x + k]) +
+                                  std::abs(src1n[x + u2 + k] - src3n[x + k]);
+                    }
+
+                    s1 = (s1 >= 0) ? s1 : (s2 >= 0 ? s2 : s0);
+                    s2 = (s2 >= 0) ? s2 : (s1 >= 0 ? s1 : s0);
+
+                    const int ip = (src1p[x + u] + src1n[x - u] + 1) >> 1; // should use cubic if ucubic=true
+                    const int v = std::abs(src1p[x] - ip) + std::abs(src1n[x] - ip);
+                    ccosts[d->tpitch * x + u] = d->alpha * (s0 + s1 + s2) + d->beta * std::abs(u) + d->remainingWeight * v;
                 }
-
-                if ((u <= 0 && x >= -u2) || (u >= 0 && x < width - u2)) {
-                    s2 = 0;
-                    for (int k = -(d->nrad); k <= d->nrad; k++)
-                        s2 += std::abs(src3p[x + u2 + k] - src1p[x + k]) +
-                              std::abs(src1p[x + u2 + k] - src1n[x + k]) +
-                              std::abs(src1n[x + u2 + k] - src3n[x + k]);
-                }
-
-                s1 = (s1 >= 0) ? s1 : (s2 >= 0 ? s2 : s0);
-                s2 = (s2 >= 0) ? s2 : (s1 >= 0 ? s1 : s0);
-
-                const int ip = (src1p[x + u] + src1n[x - u] + 1) >> 1; // should use cubic if ucubic=true
-                const int v = std::abs(src1p[x] - ip) + std::abs(src1n[x] - ip);
-                ccosts[d->tpitch * x + u] = d->alpha * (s0 + s1 + s2) + d->beta * std::abs(u) + d->remainingWeight * v;
             }
         }
     } else {
         for (int x = 0; x < width; x++) {
-            const int umax = std::min({ x, width - 1 - x, d->mdis });
+            if (!bmask || bmask[x]) {
+                const int umax = std::min({ x, width - 1 - x, d->mdis });
+                for (int u = -umax; u <= umax; u++) {
+                    int s = 0;
 
-            for (int u = -umax; u <= umax; u++) {
-                int s = 0;
+                    for (int k = -(d->nrad); k <= d->nrad; k++)
+                        s += std::abs(src3p[x + u + k] - src1p[x - u + k]) +
+                             std::abs(src1p[x + u + k] - src1n[x - u + k]) +
+                             std::abs(src1n[x + u + k] - src3n[x - u + k]);
 
-                for (int k = -(d->nrad); k <= d->nrad; k++)
-                    s += std::abs(src3p[x + u + k] - src1p[x - u + k]) +
-                         std::abs(src1p[x + u + k] - src1n[x - u + k]) +
-                         std::abs(src1n[x + u + k] - src3n[x - u + k]);
-
-                const int ip = (src1p[x + u] + src1n[x - u] + 1) >> 1; // should use cubic if ucubic=true
-                const int v = std::abs(src1p[x] - ip) + std::abs(src1n[x] - ip);
-                ccosts[d->tpitch * x + u] = d->alpha * s + d->beta * std::abs(u) + d->remainingWeight * v;
+                    const int ip = (src1p[x + u] + src1n[x - u] + 1) >> 1; // should use cubic if ucubic=true
+                    const int v = std::abs(src1p[x] - ip) + std::abs(src1n[x] - ip);
+                    ccosts[d->tpitch * x + u] = d->alpha * s + d->beta * std::abs(u) + d->remainingWeight * v;
+                }
             }
         }
     }
 }
 
 template<>
-inline void calculateConnectionCosts(const float * src3p, const float * src1p, const float * src1n, const float * src3n, float * VS_RESTRICT ccosts,
-                                     const int width, const EEDI3Data * d) noexcept {
+inline void calculateConnectionCosts(const float * src3p, const float * src1p, const float * src1n, const float * src3n, const bool * bmask, float * VS_RESTRICT ccosts,
+                                     const int width, const EEDI3Data * const VS_RESTRICT d) noexcept {
     if (d->cost3) {
         for (int x = 0; x < width; x++) {
-            const int umax = std::min({ x, width - 1 - x, d->mdis });
+            if (!bmask || bmask[x]) {
+                const int umax = std::min({ x, width - 1 - x, d->mdis });
+                for (int u = -umax; u <= umax; u++) {
+                    const int u2 = u * 2;
+                    float s0 = 0.0f, s1 = -FLT_MAX, s2 = -FLT_MAX;
 
-            for (int u = -umax; u <= umax; u++) {
-                const int u2 = u * 2;
-                float s0 = 0.f, s1 = -FLT_MAX, s2 = -FLT_MAX;
-
-                for (int k = -(d->nrad); k <= d->nrad; k++)
-                    s0 += std::abs(src3p[x + u + k] - src1p[x - u + k]) +
-                          std::abs(src1p[x + u + k] - src1n[x - u + k]) +
-                          std::abs(src1n[x + u + k] - src3n[x - u + k]);
-
-                if ((u >= 0 && x >= u2) || (u <= 0 && x < width + u2)) {
-                    s1 = 0.f;
                     for (int k = -(d->nrad); k <= d->nrad; k++)
-                        s1 += std::abs(src3p[x + k] - src1p[x - u2 + k]) +
-                              std::abs(src1p[x + k] - src1n[x - u2 + k]) +
-                              std::abs(src1n[x + k] - src3n[x - u2 + k]);
+                        s0 += std::abs(src3p[x + u + k] - src1p[x - u + k]) +
+                              std::abs(src1p[x + u + k] - src1n[x - u + k]) +
+                              std::abs(src1n[x + u + k] - src3n[x - u + k]);
+
+                    if ((u >= 0 && x >= u2) || (u <= 0 && x < width + u2)) {
+                        s1 = 0.0f;
+                        for (int k = -(d->nrad); k <= d->nrad; k++)
+                            s1 += std::abs(src3p[x + k] - src1p[x - u2 + k]) +
+                                  std::abs(src1p[x + k] - src1n[x - u2 + k]) +
+                                  std::abs(src1n[x + k] - src3n[x - u2 + k]);
+                    }
+
+                    if ((u <= 0 && x >= -u2) || (u >= 0 && x < width - u2)) {
+                        s2 = 0.0f;
+                        for (int k = -(d->nrad); k <= d->nrad; k++)
+                            s2 += std::abs(src3p[x + u2 + k] - src1p[x + k]) +
+                                  std::abs(src1p[x + u2 + k] - src1n[x + k]) +
+                                  std::abs(src1n[x + u2 + k] - src3n[x + k]);
+                    }
+
+                    s1 = (s1 > -FLT_MAX) ? s1 : (s2 > -FLT_MAX ? s2 : s0);
+                    s2 = (s2 > -FLT_MAX) ? s2 : (s1 > -FLT_MAX ? s1 : s0);
+
+                    const float ip = (src1p[x + u] + src1n[x - u]) / 2.0f; // should use cubic if ucubic=true
+                    const float v = std::abs(src1p[x] - ip) + std::abs(src1n[x] - ip);
+                    ccosts[d->tpitch * x + u] = d->alpha * (s0 + s1 + s2) + d->beta * std::abs(u) + d->remainingWeight * v;
                 }
-
-                if ((u <= 0 && x >= -u2) || (u >= 0 && x < width - u2)) {
-                    s2 = 0.f;
-                    for (int k = -(d->nrad); k <= d->nrad; k++)
-                        s2 += std::abs(src3p[x + u2 + k] - src1p[x + k]) +
-                              std::abs(src1p[x + u2 + k] - src1n[x + k]) +
-                              std::abs(src1n[x + u2 + k] - src3n[x + k]);
-                }
-
-                s1 = (s1 > -FLT_MAX) ? s1 : (s2 > -FLT_MAX ? s2 : s0);
-                s2 = (s2 > -FLT_MAX) ? s2 : (s1 > -FLT_MAX ? s1 : s0);
-
-                const float ip = (src1p[x + u] + src1n[x - u]) * 0.5f; // should use cubic if ucubic=true
-                const float v = std::abs(src1p[x] - ip) + std::abs(src1n[x] - ip);
-                ccosts[d->tpitch * x + u] = d->alpha * (s0 + s1 + s2) + d->beta * std::abs(u) + d->remainingWeight * v;
             }
         }
     } else {
         for (int x = 0; x < width; x++) {
-            const int umax = std::min({ x, width - 1 - x, d->mdis });
+            if (!bmask || bmask[x]) {
+                const int umax = std::min({ x, width - 1 - x, d->mdis });
+                for (int u = -umax; u <= umax; u++) {
+                    float s = 0.0f;
 
-            for (int u = -umax; u <= umax; u++) {
-                float s = 0.f;
+                    for (int k = -(d->nrad); k <= d->nrad; k++)
+                        s += std::abs(src3p[x + u + k] - src1p[x - u + k]) +
+                             std::abs(src1p[x + u + k] - src1n[x - u + k]) +
+                             std::abs(src1n[x + u + k] - src3n[x - u + k]);
 
-                for (int k = -(d->nrad); k <= d->nrad; k++)
-                    s += std::abs(src3p[x + u + k] - src1p[x - u + k]) +
-                         std::abs(src1p[x + u + k] - src1n[x - u + k]) +
-                         std::abs(src1n[x + u + k] - src3n[x - u + k]);
-
-                const float ip = (src1p[x + u] + src1n[x - u]) * 0.5f; // should use cubic if ucubic=true
-                const float v = std::abs(src1p[x] - ip) + std::abs(src1n[x] - ip);
-                ccosts[d->tpitch * x + u] = d->alpha * s + d->beta * std::abs(u) + d->remainingWeight * v;
+                    const float ip = (src1p[x + u] + src1n[x - u]) / 2.0f; // should use cubic if ucubic=true
+                    const float v = std::abs(src1p[x] - ip) + std::abs(src1n[x] - ip);
+                    ccosts[d->tpitch * x + u] = d->alpha * s + d->beta * std::abs(u) + d->remainingWeight * v;
+                }
             }
         }
     }
 }
 
-template<typename T1, typename T2>
-static void process_c(const VSFrameRef * src, const VSFrameRef * scp, VSFrameRef * dst, VSFrameRef ** pad, const int field_n, const EEDI3Data * d, const VSAPI * vsapi) noexcept {
+template<typename T1>
+static void filter_c(const VSFrameRef * src, const VSFrameRef * scp, const VSFrameRef * mclip, VSFrameRef * mcp, VSFrameRef * dst, VSFrameRef ** pad,
+                     const int field_n, const EEDI3Data * const VS_RESTRICT d, const VSAPI * vsapi) noexcept {
     for (int plane = 0; plane < d->vi.format->numPlanes; plane++) {
         if (d->process[plane]) {
             copyPad<T1>(src, pad[plane], plane, 1 - field_n, d->dh, vsapi);
@@ -170,13 +175,20 @@ static void process_c(const VSFrameRef * src, const VSFrameRef * scp, VSFrameRef
             const T1 * _srcp = reinterpret_cast<const T1 *>(vsapi->getReadPtr(pad[plane], 0)) + 12;
             T1 * VS_RESTRICT _dstp = reinterpret_cast<T1 *>(vsapi->getWritePtr(dst, plane));
 
+            const uint8_t * _maskp = nullptr;
+            if (d->mclip) {
+                copyMask(mclip, mcp, plane, field_n, d->dh, vsapi);
+                _maskp = vsapi->getReadPtr(mcp, plane);
+            }
+
             const auto threadId = std::this_thread::get_id();
+            bool * bmask = d->bmask.at(threadId);
             float * ccosts = d->ccosts.at(threadId) + d->mdis;
             float * pcosts = d->pcosts.at(threadId) + d->mdis;
             int * pbackt = d->pbackt.at(threadId) + d->mdis;
             int * fpath = d->fpath.at(threadId);
             int * _dmap = d->dmap.at(threadId);
-            float * tline = d->tline.at(threadId);
+            int * tline = d->tline.at(threadId);
 
             vs_bitblt(_dstp + dstStride * (1 - field_n), vsapi->getStride(dst, plane) * 2,
                       _srcp + srcStride * (4 + 1 - field_n), vsapi->getStride(pad[plane], 0) * 2,
@@ -196,7 +208,30 @@ static void process_c(const VSFrameRef * src, const VSFrameRef * scp, VSFrameRef
                 const T1 * src1n = srcp + srcStride;
                 const T1 * src3n = srcp + srcStride * 3;
 
-                calculateConnectionCosts<T1>(src3p, src1p, src1n, src3n, ccosts, dstWidth, d);
+                if (bmask) {
+                    const uint8_t * maskp = _maskp + vsapi->getStride(mcp, plane) * off;
+                    const int minmdis = std::min(dstWidth, d->mdis);
+                    int last = -666999;
+
+                    for (int x = 0; x < minmdis; x++) {
+                        if (maskp[x])
+                            last = x + d->mdis;
+                    }
+
+                    for (int x = 0; x < dstWidth - minmdis; x++) {
+                        if (maskp[x + d->mdis])
+                            last = x + d->mdis * 2;
+
+                        bmask[x] = (x <= last);
+                    }
+
+                    for (int x = dstWidth - minmdis; x < dstWidth; x++)
+                        bmask[x] = (x <= last);
+
+                    memset(ccosts - d->mdis, 0, dstWidth * d->tpitch * sizeof(float));
+                }
+
+                calculateConnectionCosts<T1>(src3p, src1p, src1n, src3n, bmask, ccosts, dstWidth, d);
 
                 // calculate path costs
                 *pcosts = *ccosts;
@@ -206,25 +241,41 @@ static void process_c(const VSFrameRef * src, const VSFrameRef * scp, VSFrameRef
                     float * pT = pcosts + d->tpitch * x;
                     int * piT = pbackt + d->tpitch * (x - 1);
 
-                    const int umax = std::min({ x, dstWidth - 1 - x, d->mdis });
-                    const int umax2 = std::min({ x - 1, dstWidth - x, d->mdis });
-
-                    for (int u = -umax; u <= umax; u++) {
-                        int idx = 0;
-                        float bval = FLT_MAX;
-
-                        for (int v = std::max(-umax2, u - 1); v <= std::min(umax2, u + 1); v++) {
-                            const double z = ppT[v] + d->gamma * std::abs(u - v);
-                            const float ccost = static_cast<float>(std::min(z, FLT_MAX * 0.9));
-                            if (ccost < bval) {
-                                bval = ccost;
-                                idx = v;
+                    if (bmask && !bmask[x]) {
+                        if (x == 1) {
+                            const int umax = std::min({ x, dstWidth - 1 - x, d->mdis });
+                            for (int u = -umax; u <= umax; u++)
+                                pT[u] = tT[u];
+                            memset(piT - d->mdis, 0, d->tpitch * sizeof(int));
+                        } else {
+                            memcpy(pT - d->mdis, ppT - d->mdis, d->tpitch * sizeof(float));
+                            memcpy(piT - d->mdis, piT - d->mdis - d->tpitch, d->tpitch * sizeof(int));
+                            const int pumax = std::min(x - 1, dstWidth - x);
+                            if (pumax < d->mdis) {
+                                piT[-pumax] = 1 - pumax;
+                                piT[pumax] = pumax - 1;
                             }
                         }
+                    } else {
+                        const int umax = std::min({ x, dstWidth - 1 - x, d->mdis });
+                        const int umax2 = std::min({ x - 1, dstWidth - x, d->mdis });
+                        for (int u = -umax; u <= umax; u++) {
+                            int idx = 0;
+                            float bval = FLT_MAX;
 
-                        const double z = bval + tT[u];
-                        pT[u] = static_cast<float>(std::min(z, FLT_MAX * 0.9));
-                        piT[u] = idx;
+                            for (int v = std::max(-umax2, u - 1); v <= std::min(umax2, u + 1); v++) {
+                                const double z = ppT[v] + d->gamma * std::abs(u - v);
+                                const float ccost = static_cast<float>(std::min(z, FLT_MAX * 0.9));
+                                if (ccost < bval) {
+                                    bval = ccost;
+                                    idx = v;
+                                }
+                            }
+
+                            const double z = bval + tT[u];
+                            pT[u] = static_cast<float>(std::min(z, FLT_MAX * 0.9));
+                            piT[u] = idx;
+                        }
                     }
                 }
 
@@ -233,7 +284,7 @@ static void process_c(const VSFrameRef * src, const VSFrameRef * scp, VSFrameRef
                 for (int x = dstWidth - 2; x >= 0; x--)
                     fpath[x] = pbackt[d->tpitch * x + fpath[x + 1]];
 
-                interpolate<T1>(src3p, src1p, src1n, src3n, fpath, dmap, dstp, dstWidth, d->ucubic, d->peak);
+                interpolate<T1>(src3p, src1p, src1n, src3n, bmask, fpath, dmap, dstp, dstWidth, d->ucubic, d->peak);
             }
 
             if (d->vcheck) {
@@ -267,53 +318,53 @@ static void selectFunctions(const unsigned opt, EEDI3Data * d) noexcept {
 #endif
 
     if (d->vi.format->bytesPerSample == 1) {
-        d->processor = process_c<uint8_t, void>;
+        d->filter = filter_c<uint8_t>;
 
 #ifdef VS_TARGET_CPU_X86
         if ((opt == 0 && iset >= 9) || opt == 5)
-            d->processor = process_avx512<uint8_t, int>;
+            d->filter = filter_avx512<uint8_t, int>;
         else if ((opt == 0 && iset >= 7) || opt == 4)
-            d->processor = process_avx<uint8_t, float>;
+            d->filter = filter_avx<uint8_t, float>;
         else if ((opt == 0 && iset >= 5) || opt == 3)
-            d->processor = process_sse4<uint8_t, int>;
+            d->filter = filter_sse4<uint8_t, int>;
         else if ((opt == 0 && iset >= 2) || opt == 2)
-            d->processor = process_sse2<uint8_t, int>;
+            d->filter = filter_sse2<uint8_t, int>;
 #endif
     } else if (d->vi.format->bytesPerSample == 2) {
-        d->processor = process_c<uint16_t, void>;
+        d->filter = filter_c<uint16_t>;
 
 #ifdef VS_TARGET_CPU_X86
         if ((opt == 0 && iset >= 9) || opt == 5)
-            d->processor = process_avx512<uint16_t, int>;
+            d->filter = filter_avx512<uint16_t, int>;
         else if ((opt == 0 && iset >= 7) || opt == 4)
-            d->processor = process_avx<uint16_t, float>;
+            d->filter = filter_avx<uint16_t, float>;
         else if ((opt == 0 && iset >= 5) || opt == 3)
-            d->processor = process_sse4<uint16_t, int>;
+            d->filter = filter_sse4<uint16_t, int>;
         else if ((opt == 0 && iset >= 2) || opt == 2)
-            d->processor = process_sse2<uint16_t, int>;
+            d->filter = filter_sse2<uint16_t, int>;
 #endif
     } else {
-        d->processor = process_c<float, void>;
+        d->filter = filter_c<float>;
 
 #ifdef VS_TARGET_CPU_X86
         if ((opt == 0 && iset >= 9) || opt == 5)
-            d->processor = process_avx512<float, float>;
+            d->filter = filter_avx512<float, float>;
         else if ((opt == 0 && iset >= 7) || opt == 4)
-            d->processor = process_avx<float, float>;
+            d->filter = filter_avx<float, float>;
         else if ((opt == 0 && iset >= 5) || opt == 3)
-            d->processor = process_sse4<float, float>;
+            d->filter = filter_sse4<float, float>;
         else if ((opt == 0 && iset >= 2) || opt == 2)
-            d->processor = process_sse2<float, float>;
+            d->filter = filter_sse2<float, float>;
 #endif
     }
 }
 
-static void VS_CC eedi3Init(VSMap *in, VSMap *out, void **instanceData, VSNode *node, VSCore *core, const VSAPI *vsapi) {
+static void VS_CC eedi3Init(VSMap * in, VSMap * out, void ** instanceData, VSNode * node, VSCore * core, const VSAPI * vsapi) {
     EEDI3Data * d = static_cast<EEDI3Data *>(*instanceData);
     vsapi->setVideoInfo(&d->vi, 1, node);
 }
 
-static const VSFrameRef *VS_CC eedi3GetFrame(int n, int activationReason, void **instanceData, void **frameData, VSFrameContext *frameCtx, VSCore *core, const VSAPI *vsapi) {
+static const VSFrameRef * VS_CC eedi3GetFrame(int n, int activationReason, void ** instanceData, void ** frameData, VSFrameContext * frameCtx, VSCore * core, const VSAPI * vsapi) {
     EEDI3Data * d = static_cast<EEDI3Data *>(*instanceData);
 
     if (activationReason == arInitial) {
@@ -321,6 +372,9 @@ static const VSFrameRef *VS_CC eedi3GetFrame(int n, int activationReason, void *
 
         if (d->vcheck && d->sclip)
             vsapi->requestFrameFilter(n, d->sclip, frameCtx);
+
+        if (d->mclip)
+            vsapi->requestFrameFilter(d->field > 1 ? n / 2 : n, d->mclip, frameCtx);
     } else if (activationReason == arAllFramesReady) {
 #ifdef VS_TARGET_CPU_X86
         no_subnormals();
@@ -335,49 +389,56 @@ static const VSFrameRef *VS_CC eedi3GetFrame(int n, int activationReason, void *
                     if (!srcVector)
                         throw std::string{ "malloc failure (srcVector)" };
                     d->srcVector.emplace(threadId, srcVector);
+
+                    if (d->mclip) {
+                        uint8_t * mskVector = new (std::nothrow) uint8_t[d->vi.width * d->vectorSize];
+                        if (!mskVector)
+                            throw std::string{ "malloc failure (mskVector)" };
+                        d->mskVector.emplace(threadId, mskVector);
+                    } else {
+                        d->mskVector.emplace(threadId, nullptr);
+                    }
                 } else {
                     d->srcVector.emplace(threadId, nullptr);
+                    d->mskVector.emplace(threadId, nullptr);
                 }
-            }
 
-            if (!d->ccosts.count(threadId)) {
+                if (d->mclip) {
+                    bool * bmask = new (std::nothrow) bool[d->vi.width];
+                    if (!bmask)
+                        throw std::string{ "malloc failure (bmask)" };
+                    d->bmask.emplace(threadId, bmask);
+                } else {
+                    d->bmask.emplace(threadId, nullptr);
+                }
+
                 float * ccosts = vs_aligned_malloc<float>(d->vi.width * d->tpitchVector * sizeof(float), d->alignment);
                 if (!ccosts)
                     throw std::string{ "malloc failure (ccosts)" };
                 d->ccosts.emplace(threadId, ccosts);
-            }
 
-            if (!d->pcosts.count(threadId)) {
                 float * pcosts = vs_aligned_malloc<float>(d->vi.width * d->tpitchVector * sizeof(float), d->alignment);
                 if (!pcosts)
                     throw std::string{ "malloc failure (pcosts)" };
                 d->pcosts.emplace(threadId, pcosts);
-            }
 
-            if (!d->pbackt.count(threadId)) {
                 int * pbackt = vs_aligned_malloc<int>(d->vi.width * d->tpitchVector * sizeof(int), d->alignment);
                 if (!pbackt)
                     throw std::string{ "malloc failure (pbackt)" };
                 d->pbackt.emplace(threadId, pbackt);
-            }
 
-            if (!d->fpath.count(threadId)) {
                 int * fpath = new (std::nothrow) int[d->vi.width];
                 if (!fpath)
                     throw std::string{ "malloc failure (fpath)" };
                 d->fpath.emplace(threadId, fpath);
-            }
 
-            if (!d->dmap.count(threadId)) {
                 int * dmap = new (std::nothrow) int[d->vi.width * d->vi.height];
                 if (!dmap)
                     throw std::string{ "malloc failure (dmap)" };
                 d->dmap.emplace(threadId, dmap);
-            }
 
-            if (!d->tline.count(threadId)) {
                 if (d->vcheck) {
-                    float * tline = new (std::nothrow) float[d->vi.width];
+                    int * tline = new (std::nothrow) int[d->vi.width];
                     if (!tline)
                         throw std::string{ "malloc failure (tline)" };
                     d->tline.emplace(threadId, tline);
@@ -391,13 +452,18 @@ static const VSFrameRef *VS_CC eedi3GetFrame(int n, int activationReason, void *
         }
 
         const VSFrameRef * src = vsapi->getFrameFilter(d->field > 1 ? n / 2 : n, d->node, frameCtx);
-        const VSFrameRef * fr[] = { d->process[0] ? nullptr : src, d->process[1] ? nullptr : src, d->process[2] ? nullptr : src };
-        const int pl[] = { 0, 1, 2 };
-        VSFrameRef * dst = vsapi->newVideoFrame2(d->vi.format, d->vi.width, d->vi.height, fr, pl, src, core);
+        VSFrameRef * dst = vsapi->newVideoFrame(d->vi.format, d->vi.width, d->vi.height, src, core);
 
         const VSFrameRef * scp = nullptr;
         if (d->vcheck && d->sclip)
             scp = vsapi->getFrameFilter(n, d->sclip, frameCtx);
+
+        const VSFrameRef * mclip = nullptr;
+        VSFrameRef * mcp = nullptr;
+        if (d->mclip) {
+            mclip = vsapi->getFrameFilter(d->field > 1 ? n / 2 : n, d->mclip, frameCtx);
+            mcp = vsapi->newVideoFrame(vsapi->getVideoInfo(d->mclip)->format, d->vi.width, d->vi.height / 2, nullptr, core);
+        }
 
         VSFrameRef * pad[3] = {};
         for (int plane = 0; plane < d->vi.format->numPlanes; plane++) {
@@ -429,7 +495,7 @@ static const VSFrameRef *VS_CC eedi3GetFrame(int n, int activationReason, void *
             field_n = field;
         }
 
-        d->processor(src, scp, dst, pad, field_n, d, vsapi);
+        d->filter(src, scp, mclip, mcp, dst, pad, field_n, d, vsapi);
 
         VSMap * props = vsapi->getFramePropsRW(dst);
         vsapi->propSetInt(props, "_FieldBased", 0, paReplace);
@@ -447,6 +513,8 @@ static const VSFrameRef *VS_CC eedi3GetFrame(int n, int activationReason, void *
 
         vsapi->freeFrame(src);
         vsapi->freeFrame(scp);
+        vsapi->freeFrame(mclip);
+        vsapi->freeFrame(mcp);
         for (int plane = 0; plane < d->vi.format->numPlanes; plane++)
             vsapi->freeFrame(pad[plane]);
 
@@ -456,14 +524,21 @@ static const VSFrameRef *VS_CC eedi3GetFrame(int n, int activationReason, void *
     return nullptr;
 }
 
-static void VS_CC eedi3Free(void *instanceData, VSCore *core, const VSAPI *vsapi) {
+static void VS_CC eedi3Free(void * instanceData, VSCore * core, const VSAPI * vsapi) {
     EEDI3Data * d = static_cast<EEDI3Data *>(instanceData);
 
     vsapi->freeNode(d->node);
     vsapi->freeNode(d->sclip);
+    vsapi->freeNode(d->mclip);
 
     for (auto & iter : d->srcVector)
         vs_aligned_free(iter.second);
+
+    for (auto & iter : d->mskVector)
+        delete[] iter.second;
+
+    for (auto & iter : d->bmask)
+        delete[] iter.second;
 
     for (auto & iter : d->ccosts)
         vs_aligned_free(iter.second);
@@ -486,18 +561,20 @@ static void VS_CC eedi3Free(void *instanceData, VSCore *core, const VSAPI *vsapi
     delete d;
 }
 
-void VS_CC eedi3Create(const VSMap *in, VSMap *out, void *userData, VSCore *core, const VSAPI *vsapi) {
-    std::unique_ptr<EEDI3Data> d{ new EEDI3Data{} };
+void VS_CC eedi3Create(const VSMap * in, VSMap * out, void * userData, VSCore * core, const VSAPI * vsapi) {
+    std::unique_ptr<EEDI3Data> d = std::make_unique<EEDI3Data>();
     int err;
 
     d->node = vsapi->propGetNode(in, "clip", 0, nullptr);
     d->sclip = vsapi->propGetNode(in, "sclip", 0, &err);
+    d->mclip = vsapi->propGetNode(in, "mclip", 0, &err);
     d->vi = *vsapi->getVideoInfo(d->node);
 
     try {
-        if (!isConstantFormat(&d->vi) || (d->vi.format->sampleType == stInteger && d->vi.format->bitsPerSample > 16) ||
+        if (!isConstantFormat(&d->vi) ||
+            (d->vi.format->sampleType == stInteger && d->vi.format->bitsPerSample > 16) ||
             (d->vi.format->sampleType == stFloat && d->vi.format->bitsPerSample != 32))
-            throw std::string{ "only constant format 8-16 bits integer and 32 bits float input supported" };
+            throw std::string{ "only constant format 8-16 bit integer and 32 bit float input supported" };
 
         d->field = int64ToIntS(vsapi->propGetInt(in, "field", 0, nullptr));
 
@@ -506,7 +583,7 @@ void VS_CC eedi3Create(const VSMap *in, VSMap *out, void *userData, VSCore *core
         const int m = vsapi->propNumElements(in, "planes");
 
         for (int i = 0; i < 3; i++)
-            d->process[i] = m <= 0;
+            d->process[i] = (m <= 0);
 
         for (int i = 0; i < m; i++) {
             const int n = int64ToIntS(vsapi->propGetInt(in, "planes", i, nullptr));
@@ -530,7 +607,7 @@ void VS_CC eedi3Create(const VSMap *in, VSMap *out, void *userData, VSCore *core
 
         d->gamma = static_cast<float>(vsapi->propGetFloat(in, "gamma", 0, &err));
         if (err)
-            d->gamma = 20.f;
+            d->gamma = 20.0f;
 
         d->nrad = int64ToIntS(vsapi->propGetInt(in, "nrad", 0, &err));
         if (err)
@@ -554,20 +631,20 @@ void VS_CC eedi3Create(const VSMap *in, VSMap *out, void *userData, VSCore *core
 
         float vthresh0 = static_cast<float>(vsapi->propGetFloat(in, "vthresh0", 0, &err));
         if (err)
-            vthresh0 = 32.f;
+            vthresh0 = 32.0f;
 
         float vthresh1 = static_cast<float>(vsapi->propGetFloat(in, "vthresh1", 0, &err));
         if (err)
-            vthresh1 = 64.f;
+            vthresh1 = 64.0f;
 
         d->vthresh2 = static_cast<float>(vsapi->propGetFloat(in, "vthresh2", 0, &err));
         if (err)
-            d->vthresh2 = 4.f;
+            d->vthresh2 = 4.0f;
 
         const int opt = int64ToIntS(vsapi->propGetInt(in, "opt", 0, &err));
 
         if (d->field < 0 || d->field > 3)
-            throw std::string{ "field must be 0, 1, 2 or 3" };
+            throw std::string{ "field must be 0, 1, 2, or 3" };
 
         if (!d->dh && (d->vi.height & 1))
             throw std::string{ "height must be mod 2 when dh=False" };
@@ -575,16 +652,16 @@ void VS_CC eedi3Create(const VSMap *in, VSMap *out, void *userData, VSCore *core
         if (d->dh && d->field > 1)
             throw std::string{ "field must be 0 or 1 when dh=True" };
 
-        if (d->alpha < 0.f || d->alpha > 1.f)
+        if (d->alpha < 0.0f || d->alpha > 1.0f)
             throw std::string{ "alpha must be between 0.0 and 1.0 (inclusive)" };
 
-        if (d->beta < 0.f || d->beta > 1.f)
+        if (d->beta < 0.0f || d->beta > 1.0f)
             throw std::string{ "beta must be between 0.0 and 1.0 (inclusive)" };
 
-        if (d->alpha + d->beta > 1.f)
+        if (d->alpha + d->beta > 1.0f)
             throw std::string{ "alpha+beta must be between 0.0 and 1.0 (inclusive)" };
 
-        if (d->gamma < 0.f)
+        if (d->gamma < 0.0f)
             throw std::string{ "gamma must be greater than or equal to 0.0" };
 
         if (d->nrad < 0 || d->nrad > 3)
@@ -594,13 +671,42 @@ void VS_CC eedi3Create(const VSMap *in, VSMap *out, void *userData, VSCore *core
             throw std::string{ "mdis must be between 1 and 40 (inclusive)" };
 
         if (d->vcheck < 0 || d->vcheck > 3)
-            throw std::string{ "vcheck must be 0, 1, 2 or 3" };
+            throw std::string{ "vcheck must be 0, 1, 2, or 3" };
 
-        if (d->vcheck && (vthresh0 <= 0.f || vthresh1 <= 0.f || d->vthresh2 <= 0.f))
-            throw std::string{ "vthresh0, vthresh1 and vthresh2 must be greater than 0.0" };
+        if (d->vcheck && (vthresh0 <= 0.0f || vthresh1 <= 0.0f || d->vthresh2 <= 0.0f))
+            throw std::string{ "vthresh0, vthresh1, and vthresh2 must be greater than 0.0" };
+
+        if (d->mclip) {
+            if (!isSameFormat(vsapi->getVideoInfo(d->mclip), &d->vi))
+                throw std::string{ "mclip's format doesn't match" };
+
+            if (vsapi->getVideoInfo(d->mclip)->numFrames != d->vi.numFrames)
+                throw std::string{ "mclip's number of frames doesn't match" };
+
+            if (vsapi->getVideoInfo(d->mclip)->format->bitsPerSample != 8) {
+                VSMap * args = vsapi->createMap();
+                vsapi->propSetNode(args, "clip", d->mclip, paReplace);
+                vsapi->freeNode(d->mclip);
+                vsapi->propSetInt(args, "format", vsapi->registerFormat(d->vi.format->colorFamily, stInteger, 8, d->vi.format->subSamplingW, d->vi.format->subSamplingH, core)->id, paReplace);
+
+                VSMap * ret = vsapi->invoke(vsapi->getPluginById("com.vapoursynth.resize", core), "Point", args);
+                if (vsapi->getError(ret)) {
+                    vsapi->setError(out, vsapi->getError(ret));
+                    vsapi->freeNode(d->node);
+                    vsapi->freeNode(d->sclip);
+                    vsapi->freeMap(args);
+                    vsapi->freeMap(ret);
+                    return;
+                }
+
+                d->mclip = vsapi->propGetNode(ret, "clip", 0, nullptr);
+                vsapi->freeMap(args);
+                vsapi->freeMap(ret);
+            }
+        }
 
         if (opt < 0 || opt > 5)
-            throw std::string{ "opt must be 0, 1, 2, 3, 4 or 5" };
+            throw std::string{ "opt must be 0, 1, 2, 3, 4, or 5" };
 
         if (d->field > 1) {
             if (d->vi.numFrames > INT_MAX / 2)
@@ -613,14 +719,14 @@ void VS_CC eedi3Create(const VSMap *in, VSMap *out, void *userData, VSCore *core
         if (d->dh)
             d->vi.height *= 2;
 
-        d->remainingWeight = 1.f - d->alpha - d->beta;
+        d->remainingWeight = 1.0f - d->alpha - d->beta;
 
         if (d->cost3)
-            d->alpha /= 3.f;
+            d->alpha /= 3.0f;
 
         if (d->vcheck && d->sclip) {
             if (!isSameFormat(vsapi->getVideoInfo(d->sclip), &d->vi))
-                throw std::string{ "sclip must have the same dimensions as main clip and be the same format" };
+                throw std::string{ "sclip's format doesn't match" };
 
             if (vsapi->getVideoInfo(d->sclip)->numFrames != d->vi.numFrames)
                 throw std::string{ "sclip's number of frames doesn't match" };
@@ -628,6 +734,8 @@ void VS_CC eedi3Create(const VSMap *in, VSMap *out, void *userData, VSCore *core
 
         const unsigned numThreads = vsapi->getCoreInfo(core)->numThreads;
         d->srcVector.reserve(numThreads);
+        d->mskVector.reserve(numThreads);
+        d->bmask.reserve(numThreads);
         d->ccosts.reserve(numThreads);
         d->pcosts.reserve(numThreads);
         d->pbackt.reserve(numThreads);
@@ -639,29 +747,30 @@ void VS_CC eedi3Create(const VSMap *in, VSMap *out, void *userData, VSCore *core
 
         if (d->vi.format->sampleType == stInteger) {
             d->peak = (1 << d->vi.format->bitsPerSample) - 1;
-            const float scale = d->peak / 255.f;
+            const float scale = d->peak / 255.0f;
             d->beta *= scale;
             d->gamma *= scale;
             vthresh0 *= scale;
             vthresh1 *= scale;
         } else {
-            d->beta /= 255.f;
-            d->gamma /= 255.f;
-            vthresh0 /= 255.f;
-            vthresh1 /= 255.f;
+            d->beta /= 255.0f;
+            d->gamma /= 255.0f;
+            vthresh0 /= 255.0f;
+            vthresh1 /= 255.0f;
         }
 
         d->tpitch = d->mdis * 2 + 1;
-        d->mdisVector = d->mdis * d->vectorSize;
         d->tpitchVector = d->tpitch * d->vectorSize;
+        d->mdisVector = d->mdis * d->vectorSize;
 
-        d->rcpVthresh0 = 1.f / vthresh0;
-        d->rcpVthresh1 = 1.f / vthresh1;
-        d->rcpVthresh2 = 1.f / d->vthresh2;
+        d->rcpVthresh0 = 1.0f / vthresh0;
+        d->rcpVthresh1 = 1.0f / vthresh1;
+        d->rcpVthresh2 = 1.0f / d->vthresh2;
     } catch (const std::string & error) {
         vsapi->setError(out, ("EEDI3: " + error).c_str());
         vsapi->freeNode(d->node);
         vsapi->freeNode(d->sclip);
+        vsapi->freeNode(d->mclip);
         return;
     }
 
@@ -672,11 +781,11 @@ void VS_CC eedi3Create(const VSMap *in, VSMap *out, void *userData, VSCore *core
 // Init
 
 #ifdef HAVE_OPENCL
-extern void VS_CC eedi3clCreate(const VSMap *in, VSMap *out, void *userData, VSCore *core, const VSAPI *vsapi);
+extern void VS_CC eedi3clCreate(const VSMap * in, VSMap * out, void * userData, VSCore * core, const VSAPI * vsapi);
 #endif
 
-VS_EXTERNAL_API(void) VapourSynthPluginInit(VSConfigPlugin configFunc, VSRegisterFunction registerFunc, VSPlugin *plugin) {
-    configFunc("com.holywu.eedi3", "eedi3m", "An intra-field only deinterlacer", VAPOURSYNTH_API_VERSION, 1, plugin);
+VS_EXTERNAL_API(void) VapourSynthPluginInit(VSConfigPlugin configFunc, VSRegisterFunction registerFunc, VSPlugin * plugin) {
+    configFunc("com.holywu.eedi3", "eedi3m", "Enhanced Edge Directed Interpolation 3", VAPOURSYNTH_API_VERSION, 1, plugin);
 
     registerFunc("EEDI3",
                  "clip:clip;"
@@ -696,6 +805,7 @@ VS_EXTERNAL_API(void) VapourSynthPluginInit(VSConfigPlugin configFunc, VSRegiste
                  "vthresh1:float:opt;"
                  "vthresh2:float:opt;"
                  "sclip:clip:opt;"
+                 "mclip:clip:opt;"
                  "opt:int:opt;",
                  eedi3Create, nullptr, plugin);
 

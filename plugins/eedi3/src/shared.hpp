@@ -1,9 +1,10 @@
 #pragma once
 
-#include <algorithm>
 #include <cfloat>
 #include <cmath>
 #include <cstdlib>
+
+#include <algorithm>
 #include <thread>
 #include <unordered_map>
 
@@ -52,36 +53,54 @@ static void copyPad(const VSFrameRef * src, VSFrameRef * dst, const int plane, c
 }
 
 template<typename T>
-static inline void interpolate(const T * src3p, const T * src1p, const T * src1n, const T * src3n, const int * fpath, int * VS_RESTRICT dmap, T * VS_RESTRICT dstp,
-                               const int width, const bool ucubic, const int peak) noexcept {
+static inline void interpolate(const T * src3p, const T * src1p, const T * src1n, const T * src3n, const bool * bmask, const int * fpath,
+                               int * VS_RESTRICT dmap, T * VS_RESTRICT dstp, const int width, const bool ucubic, const int peak) noexcept {
     for (int x = 0; x < width; x++) {
-        const int dir = fpath[x];
-        const int dir3 = dir * 3;
-        const int absDir3 = std::abs(dir3);
+        if (bmask && !bmask[x]) {
+            dmap[x] = 0;
 
-        dmap[x] = dir;
+            if (ucubic)
+                dstp[x] = std::min(std::max((9 * (src1p[x] + src1n[x]) - (src3p[x] + src3n[x]) + 8) >> 4, 0), peak);
+            else
+                dstp[x] = (src1p[x] + src1n[x] + 1) >> 1;
+        } else {
+            const int dir = fpath[x];
+            const int dir3 = dir * 3;
+            const int absDir3 = std::abs(dir3);
 
-        if (ucubic && x >= absDir3 && x <= width - 1 - absDir3)
-            dstp[x] = std::min(std::max((36 * (src1p[x + dir] + src1n[x - dir]) - 4 * (src3p[x + dir3] + src3n[x - dir3]) + 32) >> 6, 0), peak);
-        else
-            dstp[x] = (src1p[x + dir] + src1n[x - dir] + 1) >> 1;
+            dmap[x] = dir;
+
+            if (ucubic && x >= absDir3 && x <= width - 1 - absDir3)
+                dstp[x] = std::min(std::max((9 * (src1p[x + dir] + src1n[x - dir]) - (src3p[x + dir3] + src3n[x - dir3]) + 8) >> 4, 0), peak);
+            else
+                dstp[x] = (src1p[x + dir] + src1n[x - dir] + 1) >> 1;
+        }
     }
 }
 
 template<>
-inline void interpolate(const float * src3p, const float * src1p, const float * src1n, const float * src3n, const int * fpath, int * VS_RESTRICT dmap, float * VS_RESTRICT dstp,
-                        const int width, const bool ucubic, const int peak) noexcept {
+inline void interpolate(const float * src3p, const float * src1p, const float * src1n, const float * src3n, const bool * bmask, const int * fpath,
+                        int * VS_RESTRICT dmap, float * VS_RESTRICT dstp, const int width, const bool ucubic, const int peak) noexcept {
     for (int x = 0; x < width; x++) {
-        const int dir = fpath[x];
-        const int dir3 = dir * 3;
-        const int absDir3 = std::abs(dir3);
+        if (bmask && !bmask[x]) {
+            dmap[x] = 0;
 
-        dmap[x] = dir;
+            if (ucubic)
+                dstp[x] = 0.5625f * (src1p[x] + src1n[x]) - 0.0625f * (src3p[x] + src3n[x]);
+            else
+                dstp[x] = (src1p[x] + src1n[x]) / 2.0f;
+        } else {
+            const int dir = fpath[x];
+            const int dir3 = dir * 3;
+            const int absDir3 = std::abs(dir3);
 
-        if (ucubic && x >= absDir3 && x <= width - 1 - absDir3)
-            dstp[x] = 0.5625f * (src1p[x + dir] + src1n[x - dir]) - 0.0625f * (src3p[x + dir3] + src3n[x - dir3]);
-        else
-            dstp[x] = (src1p[x + dir] + src1n[x - dir]) * 0.5f;
+            dmap[x] = dir;
+
+            if (ucubic && x >= absDir3 && x <= width - 1 - absDir3)
+                dstp[x] = 0.5625f * (src1p[x + dir] + src1n[x - dir]) - 0.0625f * (src3p[x + dir3] + src3n[x - dir3]);
+            else
+                dstp[x] = (src1p[x + dir] + src1n[x - dir]) / 2.0f;
+        }
     }
 }
 
@@ -101,7 +120,7 @@ static void vCheck(const T * srcp, const T * scpp, T * VS_RESTRICT dstp, const i
 
             for (int x = 0; x < dstWidth; x++) {
                 const int dirc = dmap[x];
-                const T cint = scpp ? scpp[x] : std::min(std::max((36 * (dst1p[x] + dst1n[x]) - 4 * (dst3p[x] + dst3n[x]) + 32) >> 6, 0), peak);
+                const T cint = scpp ? scpp[x] : std::min(std::max((9 * (dst1p[x] + dst1n[x]) - (dst3p[x] + dst3n[x]) + 8) >> 4, 0), peak);
 
                 if (dirc == 0) {
                     tline[x] = cint;
@@ -132,10 +151,10 @@ static void vCheck(const T * srcp, const T * scpp, T * VS_RESTRICT dstp, const i
 
                 const float a0 = mdiff0 * rcpVthresh0;
                 const float a1 = mdiff1 * rcpVthresh1;
-                const float a2 = std::max((vthresh2 - std::abs(dirc)) * rcpVthresh2, 0.f);
-                const float a = std::min(std::max({ a0, a1, a2 }), 1.f);
+                const float a2 = std::max((vthresh2 - std::abs(dirc)) * rcpVthresh2, 0.0f);
+                const float a = std::min(std::max({ a0, a1, a2 }), 1.0f);
 
-                tline[x] = static_cast<T>((1.f - a) * dstp[x] + a * cint);
+                tline[x] = static_cast<T>((1.0f - a) * dstp[x] + a * cint);
             }
 
             memcpy(dstp, tline, dstWidth * sizeof(T));
@@ -180,9 +199,9 @@ void vCheck(const float * srcp, const float * scpp, float * VS_RESTRICT dstp, co
                     continue;
                 }
 
-                const float it = (dst2p[x + dirc] + dstp[x - dirc]) * 0.5f;
+                const float it = (dst2p[x + dirc] + dstp[x - dirc]) / 2.0f;
                 const float vt = std::abs(dst2p[x + dirc] - dst1p[x + dirc]) + std::abs(dstp[x + dirc] - dst1p[x + dirc]);
-                const float ib = (dstp[x + dirc] + dst2n[x - dirc]) * 0.5f;
+                const float ib = (dstp[x + dirc] + dst2n[x - dirc]) / 2.0f;
                 const float vb = std::abs(dst2n[x - dirc] - dst1n[x - dirc]) + std::abs(dstp[x - dirc] - dst1n[x - dirc]);
                 const float vc = std::abs(dstp[x] - dst1p[x]) + std::abs(dstp[x] - dst1n[x]);
 
@@ -191,15 +210,15 @@ void vCheck(const float * srcp, const float * scpp, float * VS_RESTRICT dstp, co
                 const float d2 = std::abs(vt - vc);
                 const float d3 = std::abs(vb - vc);
 
-                const float mdiff0 = (vcheck == 1) ? std::min(d0, d1) : (vcheck == 2 ? (d0 + d1) * 0.5f : std::max(d0, d1));
-                const float mdiff1 = (vcheck == 1) ? std::min(d2, d3) : (vcheck == 2 ? (d2 + d3) * 0.5f : std::max(d2, d3));
+                const float mdiff0 = (vcheck == 1) ? std::min(d0, d1) : (vcheck == 2 ? (d0 + d1) / 2.0f : std::max(d0, d1));
+                const float mdiff1 = (vcheck == 1) ? std::min(d2, d3) : (vcheck == 2 ? (d2 + d3) / 2.0f : std::max(d2, d3));
 
                 const float a0 = mdiff0 * rcpVthresh0;
                 const float a1 = mdiff1 * rcpVthresh1;
-                const float a2 = std::max((vthresh2 - std::abs(dirc)) * rcpVthresh2, 0.f);
-                const float a = std::min(std::max({ a0, a1, a2 }), 1.f);
+                const float a2 = std::max((vthresh2 - std::abs(dirc)) * rcpVthresh2, 0.0f);
+                const float a = std::min(std::max({ a0, a1, a2 }), 1.0f);
 
-                tline[x] = (1.f - a) * dstp[x] + a * cint;
+                tline[x] = (1.0f - a) * dstp[x] + a * cint;
             }
 
             memcpy(dstp, tline, dstWidth * sizeof(float));
