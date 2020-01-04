@@ -18,7 +18,6 @@
 // Foundation, Inc., 675 Mass Ave, Cambridge, MA 02139, USA, or visit
 // http://www.gnu.org/copyleft/gpl.html .
 
-#include <limits.h>
 #include <VapourSynth.h>
 #include <VSHelper.h>
 
@@ -273,12 +272,12 @@ static const VSFrameRef *VS_CC mvcompensateGetFrame(int n, int activationReason,
 
                 for (int by = 0; by < nBlkY; by++) {
                     int wby = ((by + nBlkY - 3) / (nBlkY - 2)) * 3;
-                    int wbx = 0;
                     int xx[3] = { 0 };
 
                     for (int bx = 0; bx < nBlkX; bx++) {
                         // select window
-                        wbx = bx == nBlkX - 1 ? 2 : wbx; //(bx + nBlkX - 3) / (nBlkX - 2);
+                        int wbx = (bx + nBlkX - 3) / (nBlkX - 2);
+
                         int16_t *winOver[3] = { overGetWindow(d->OverWins, wby + wbx) };
                         if (nSuperModeYUV & UVPLANES)
                             winOver[1] = winOver[2] = overGetWindow(d->OverWinsUV, wby + wbx);
@@ -306,7 +305,6 @@ static const VSFrameRef *VS_CC mvcompensateGetFrame(int n, int activationReason,
 
                             xx[plane] += (nBlkSizeX[plane] - nOverlapX[plane]) * bytesPerSample;
                         }
-                        wbx = 1;
                     }
 
                     for (int plane = 0; plane < num_planes; plane++) {
@@ -454,7 +452,7 @@ static void VS_CC mvcompensateCreate(const VSMap *in, VSMap *out, void *userData
 
     d.opt = !!vsapi->propGetInt(in, "opt", 0, &err);
     if (err)
-        d.opt = INT_MAX;
+        d.opt = 1;
 
     d.tff = !!vsapi->propGetInt(in, "tff", 0, &err);
     d.tff_exists = !err;

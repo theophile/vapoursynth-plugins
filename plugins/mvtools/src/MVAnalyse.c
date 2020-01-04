@@ -1,4 +1,3 @@
-#include <limits.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
@@ -11,6 +10,9 @@
 #include "DCTFFTW.h"
 #include "GroupOfPlanes.h"
 #include "MVAnalysisData.h"
+
+
+extern uint32_t g_cpuinfo;
 
 
 typedef struct MVAnalyseData {
@@ -361,7 +363,7 @@ static void VS_CC mvanalyseCreate(const VSMap *in, VSMap *out, void *userData, V
 
     d.opt = !!vsapi->propGetInt(in, "opt", 0, &err);
     if (err)
-        d.opt = INT_MAX;
+        d.opt = 1;
 
     d.meander = !!vsapi->propGetInt(in, "meander", 0, &err);
     if (err)

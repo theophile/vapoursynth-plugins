@@ -55,8 +55,6 @@ static void Degrain_C(uint8_t *pDst8, int nDstPitch, const uint8_t *pSrc8, int n
 // used after this function is done with them.
 template <int radius, int blockWidth, int blockHeight>
 static void Degrain_sse2(uint8_t *pDst, int nDstPitch, const uint8_t *pSrc, int nSrcPitch, const uint8_t **pRefs, const int *nRefPitches, int WSrc, const int *WRefs) {
-    static_assert(blockWidth >= 4, "");
-
     __m128i zero = _mm_setzero_si128();
     __m128i wsrc = _mm_set1_epi16(WSrc);
     __m128i wrefs[6];
@@ -164,7 +162,6 @@ static void Degrain_sse2(uint8_t *pDst, int nDstPitch, const uint8_t *pSrc, int 
     }
 }
 
-DenoiseFunction selectDegrainFunctionAVX2(unsigned radius, unsigned width, unsigned height, unsigned bits);
 
 static void LimitChanges_sse2(uint8_t *pDst, intptr_t nDstPitch, const uint8_t *pSrc, intptr_t nSrcPitch, intptr_t nWidth, intptr_t nHeight, intptr_t nLimit) {
     __m128i bytes_limit = _mm_set1_epi8(nLimit);
@@ -212,7 +209,7 @@ static inline int DegrainWeight(int64_t thSAD, int64_t blockSAD) {
     if (blockSAD >= thSAD)
         return 0;
 
-    return int((thSAD - blockSAD) * (thSAD + blockSAD) * 256 / (double)(thSAD * thSAD + blockSAD * blockSAD));
+    return int((thSAD - blockSAD) * (thSAD + blockSAD) * 256 / (thSAD * thSAD + blockSAD * blockSAD));
 }
 
 
@@ -241,10 +238,8 @@ static inline void normaliseWeights(int &WSrc, int *WRefs) {
     for (int r = 0; r < radius * 2; r++)
         WSum += WRefs[r];
 
-    double scale = 256.0 / WSum;
-
     for (int r = 0; r < radius * 2; r++) {
-        WRefs[r] = WRefs[r] * scale;
+        WRefs[r] = WRefs[r] * 256 / WSum;
         WSrc -= WRefs[r];
     }
 }
