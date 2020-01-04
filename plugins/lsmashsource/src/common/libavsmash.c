@@ -84,8 +84,6 @@ lsmash_root_t *libavsmash_open_file
         goto open_fail;
     }
     /* libavformat */
-    av_register_all();
-    avcodec_register_all();
     if( avformat_open_input( p_format_ctx, file_name, NULL, NULL ) )
     {
         strcpy( error_string, "Failed to avformat_open_input.\n" );
@@ -115,7 +113,7 @@ uint32_t libavsmash_get_track_by_media_type
 )
 {
     char error_string[128] = { 0 };
-    char *media_type_str = type == ISOM_MEDIA_HANDLER_TYPE_VIDEO_TRACK ? "video" : "audio";
+    const char *media_type_str = type == ISOM_MEDIA_HANDLER_TYPE_VIDEO_TRACK ? "video" : "audio";
     uint32_t track_id;
     lsmash_media_parameters_t media_param;
     if( track_number == 0 )
@@ -447,21 +445,20 @@ static const AVCodec *libavsmash_find_decoder
         /* Try to get any valid codec_id from summaries. */
         for( uint32_t i = 0; i < config->count && codec_id == AV_CODEC_ID_NONE; i++ )
             codec_id = get_codec_id_from_description( config->entries[i].summary );
-    return find_decoder( codec_id, config->preferred_decoder_names );
+    return find_decoder( codec_id, NULL, config->preferred_decoder_names, config->prefer_hw_decoder );
 }
 
 int libavsmash_find_and_open_decoder
 (
-    codec_configuration_t   *config,
-    const AVCodecParameters *codecpar,
-    const int                thread_count,
-    const int                refcounted_frames
+    codec_configuration_t *config,
+    const AVStream        *stream,
+    const int              thread_count
 )
 {
-    const AVCodec *codec = libavsmash_find_decoder( config, codecpar->codec_id );
+    const AVCodec *codec = libavsmash_find_decoder( config, stream->codecpar->codec_id );
     if( !codec )
         return -1;
-    return open_decoder( &config->ctx, codecpar, codec, thread_count, refcounted_frames );
+    return open_decoder( &config->ctx, stream, codec, thread_count );
 }
 
 static lsmash_codec_specific_data_type get_codec_specific_data_type
@@ -805,9 +802,11 @@ void libavsmash_flush_buffers
     const AVCodec     *codec        = config->ctx->codec;
     void              *app_specific = config->ctx->opaque;
     AVCodecParameters *codecpar     = avcodec_parameters_alloc();
+    AVStream stream = { 0 };
+    stream.codecpar = codecpar;
     if( !codecpar
      || avcodec_parameters_from_context( codecpar, config->ctx ) < 0
-     || open_decoder( &ctx, codecpar, codec, config->ctx->thread_count, config->ctx->refcounted_frames ) < 0 )
+     || open_decoder( &ctx, &stream, codec, config->ctx->thread_count ) < 0 )
     {
         avcodec_flush_buffers( config->ctx );
         config->error = 1;
@@ -857,7 +856,6 @@ void update_configuration
     char               error_string[96]  = { 0 };
     void              *app_specific      = config->ctx->opaque;
     const int          thread_count      = config->ctx->thread_count;
-    const int          refcounted_frames = config->ctx->refcounted_frames;
     AVCodecParameters *codecpar          = avcodec_parameters_alloc();
     if( !codecpar || avcodec_parameters_from_context( codecpar, config->ctx ) < 0 )
     {
@@ -868,7 +866,7 @@ void update_configuration
     config->ctx->opaque = NULL;
     avcodec_free_context( &config->ctx );
     /* Find an appropriate decoder. */
-    const AVCodec *codec = find_decoder( config->queue.codec_id, config->preferred_decoder_names );
+    const AVCodec *codec = find_decoder( config->queue.codec_id, codecpar, config->preferred_decoder_names, config->prefer_hw_decoder );
     if( !codec )
     {
         strcpy( error_string, "Failed to find the decoder.\n" );
@@ -914,7 +912,9 @@ void update_configuration
     /* Open an appropriate decoder.
      * Here, we force single threaded decoding since some decoder doesn't do its proper initialization with multi-threaded decoding. */
     AVCodecContext *ctx = NULL;
-    if( open_decoder( &ctx, codecpar, codec, 1, refcounted_frames ) < 0 )
+    AVStream stream = { 0 };
+    stream.codecpar = codecpar;
+    if( open_decoder( &ctx, &stream, codec, 1 ) < 0 )
     {
         strcpy( error_string, "Failed to open decoder.\n" );
         goto fail;

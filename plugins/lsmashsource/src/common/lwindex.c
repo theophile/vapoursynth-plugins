@@ -28,7 +28,7 @@ extern "C"
 #endif  /* __cplusplus */
 #include <libavformat/avformat.h>       /* Demuxer */
 #include <libavcodec/avcodec.h>         /* Decoder */
-#include <libavresample/avresample.h>   /* Resampler/Buffer */
+#include <libswresample/swresample.h>   /* Resampler/Buffer */
 #include <libavutil/mathematics.h>      /* Timebase rescaler */
 #include <libavutil/pixdesc.h>
 #ifdef __cplusplus
@@ -47,6 +47,13 @@ extern "C"
 #include "progress.h"
 #include "lwindex.h"
 #include "decode.h"
+
+#include <sys/stat.h>
+#include "xxhash.h"
+#ifdef _WIN32
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#endif
 
 typedef struct
 {
@@ -73,10 +80,26 @@ typedef struct
     int                number_of_helpers;
     lwindex_helper_t **helpers;
     const char       **preferred_video_decoder_names;
+    int                prefer_video_hw_decoder;
     const char       **preferred_audio_decoder_names;
     int                thread_count;
     char              *format_name;
 } lwindex_indexer_t;
+
+typedef struct
+{
+    int codec_type;
+    int codec_id;
+    AVRational time_base;
+    int width;
+    int height;
+    char fmt[64];
+    int colorspace;
+    int channels;
+    uint64_t layout;
+    int sample_rate;
+    int bits_per_sample;
+} lwindex_stream_info_t;
 
 typedef struct
 {
@@ -1105,14 +1128,6 @@ static inline int check_vp8_invisible_frame( const AVPacket *pkt )
     return !(pkt->data[0] & 0x10);
 }
 
-static inline int check_vp9_invisible_frame( const AVPacket *pkt )
-{
-    if( ((pkt->data[0] >> 4) & 0x03) == 0x03 )
-        return !(pkt->data[0] & 0x04) && !(pkt->data[0] & 0x01);
-    else
-        return !(pkt->data[0] & 0x08) && !(pkt->data[0] & 0x02);
-}
-
 static void create_video_visible_frame_list
 (
     lwlibav_video_decode_handler_t *vdhp,
@@ -1311,7 +1326,7 @@ static lwindex_helper_t *get_index_helper
         const char **preferred_decoder_names = codecpar->codec_type == AVMEDIA_TYPE_VIDEO
                                              ? indexer->preferred_video_decoder_names
                                              : indexer->preferred_audio_decoder_names;
-        if( find_and_open_decoder( &helper->codec_ctx, codecpar, preferred_decoder_names, indexer->thread_count, 0 ) < 0 )
+        if( find_and_open_decoder( &helper->codec_ctx, stream, preferred_decoder_names, indexer->prefer_video_hw_decoder, indexer->thread_count ) < 0 )
             /* Failed to find and open an appropriate decoder, but do not abort indexing. */
             return helper;
         helper->mpeg12_video = (codecpar->codec_id == AV_CODEC_ID_MPEG1VIDEO || codecpar->codec_id == AV_CODEC_ID_MPEG2VIDEO);
@@ -1969,6 +1984,23 @@ static void cleanup_index_helpers( lwindex_indexer_t *indexer, AVFormatContext *
     av_freep( &indexer->helpers );
 }
 
+static unsigned xxhash_file( const char *file_path, int64_t file_size )
+{
+    uint8_t *file_buffer = (uint8_t *)lw_malloc_zero( 1 << 21 );
+    const size_t read_len = 1 << 20;
+    FILE *fp = lw_fopen( file_path, "rb" );
+    size_t buffer_len = fread( file_buffer, 1, read_len, fp );
+    if( file_size > (1 << 21) )
+    {
+        fseek( fp, -(1 << 20), SEEK_END );
+        buffer_len += fread( file_buffer + buffer_len, 1, read_len, fp );
+    }
+    fclose( fp );
+    unsigned hash = XXH32( file_buffer, buffer_len, 0 );
+    lw_free( file_buffer );
+    return hash;
+}
+
 static void create_index
 (
     lwlibav_file_handler_t         *lwhp,
@@ -1995,13 +2027,17 @@ static void create_index
     }
     /*
         # Structure of Libav reader index file
-        <LibavReaderIndexFile=13>
-        <InputFilePath>foobar.omo</InputFilePath>
+        <LibavReaderIndexFile=16>
+        <FileSize=1048576>
+        <FileHash=0x1234abcd>
         <LibavReaderIndex=0x00000208,0,marumoska>
         <ActiveVideoStreamIndex>+0000000000</ActiveVideoStreamIndex>
         <ActiveAudioStreamIndex>-0000000001</ActiveAudioStreamIndex>
-        Index=0,Type=0,Codec=2,TimeBase=1001/24000,POS=0,PTS=2002,DTS=0,EDI=0
-        Key=1,Pic=1,POC=0,Repeat=1,Field=0,Width=1920,Height=1080,Format=yuv420p,ColorSpace=5
+        <StreamInfo=0,0>
+        Codec=2,TimeBase=1001/24000,Width=1920,Height=1080,Format=yuv420p,ColorSpace=5
+        </StreamInfo>
+        Index=0,POS=0,PTS=2002,DTS=0,EDI=0
+        Key=1,Pic=1,POC=0,Repeat=1,Field=0
         </LibavReaderIndex>
         <StreamDuration=0,0>5000</StreamDuration>
         <StreamIndexEntries=0,0,1>
@@ -2013,9 +2049,15 @@ static void create_index
         </ExtraDataList>
         </LibavReaderIndexFile>
      */
-    char index_path[512] = { 0 };
-    sprintf( index_path, "%s.lwi", lwhp->file_path );
-    FILE *index = !opt->no_create_index ? lw_fopen( index_path, "wb" ) : NULL;
+    FILE *index;
+    if( opt->index_file_path && *opt->index_file_path )
+        index = !opt->no_create_index ? lw_fopen( opt->index_file_path, "wb" ) : NULL;
+    else
+    {
+        char index_path[512] = { 0 };
+        sprintf( index_path, "%s.lwi", lwhp->file_path );
+        index = !opt->no_create_index ? lw_fopen( index_path, "wb" ) : NULL;
+    }
     if( !index && !opt->no_create_index )
     {
         free( video_info );
@@ -2043,15 +2085,28 @@ static void create_index
         fprintf( index, "<LSMASHWorksIndexVersion=%" PRIu8 ".%" PRIu8 ".%" PRIu8 ".%" PRIu8 ">\n",
                  lwindex_version[0], lwindex_version[1], lwindex_version[2], lwindex_version[3] );
         fprintf( index, "<LibavReaderIndexFile=%d>\n", LWINDEX_INDEX_FILE_VERSION );
-        fprintf( index, "<InputFilePath>%s</InputFilePath>\n", lwhp->file_path );
+#ifdef _WIN32
+        wchar_t *wname;
+        struct _stat64 file_stat;
+        if( lw_string_to_wchar( CP_UTF8, lwhp->file_path, &wname ) )
+            _wstat64( wname, &file_stat );
+        else
+            _stat64( lwhp->file_path, &file_stat );
+#else
+        struct stat file_stat;
+        stat( lwhp->file_path, &file_stat );
+#endif
+        fprintf( index, "<FileSize=%" PRId64 ">\n", file_stat.st_size );
+        fprintf( index, "<FileHash=0x%08x>\n", xxhash_file( lwhp->file_path, file_stat.st_size ) );
         fprintf( index, "<LibavReaderIndex=0x%08x,%d,%s>\n", lwhp->format_flags, lwhp->raw_demuxer, lwhp->format_name );
         video_index_pos = ftell( index );
         fprintf( index, "<ActiveVideoStreamIndex>%+011d</ActiveVideoStreamIndex>\n", -1 );
         audio_index_pos = ftell( index );
-        fprintf( index, "<ActiveAudioStreamIndex>%+011d</ActiveAudioStreamIndex>\n", -1 );
+        fprintf( index, "<ActiveAudioStreamIndex>%+011d</ActiveAudioStreamIndex>\n", adhp->stream_index == -2 ? -2 : -1 );
     }
     AVPacket pkt = { 0 };
     av_init_packet( &pkt );
+    int       pix_fmt_investigated  = 0;
     int       video_resolution      = 0;
     int       is_attached_pic       = 0;
     uint32_t  video_sample_count    = 0;
@@ -2072,19 +2127,57 @@ static void create_index
         0,                              /* number_of_helpers */
         NULL,                           /* helpers */
         vdhp->preferred_decoder_names,  /* preferred_video_decoder_names */
+        vdhp->prefer_hw_decoder,        /* prefer_video_hw_decoder */
         adhp->preferred_decoder_names,  /* preferred_audio_decoder_names */
         lwhp->threads,                  /* thread_count */
         lwhp->format_name               /* format_name */
     };
+    for( unsigned int stream_index = 0; stream_index < format_ctx->nb_streams; stream_index++ )
+    {
+        AVStream *stream = format_ctx->streams[stream_index];
+        enum AVMediaType codec_type = stream->codecpar->codec_type;
+        if( codec_type != AVMEDIA_TYPE_VIDEO
+         && codec_type != AVMEDIA_TYPE_AUDIO )
+            continue;
+        lwindex_helper_t *helper = get_index_helper( &indexer, stream );
+        if( !helper || !helper->codec_ctx )
+            continue;
+        AVCodecContext *pkt_ctx = helper->codec_ctx;
+        print_index( index, "<StreamInfo=%d,%d>\n", stream_index, codec_type );
+        if( codec_type == AVMEDIA_TYPE_VIDEO )
+            print_index( index, "Codec=%d,TimeBase=%d/%d,Width=%d,Height=%d,Format=%s,ColorSpace=%d\n",
+                         pkt_ctx->codec_id, stream->time_base.num, stream->time_base.den,
+                         pkt_ctx->width, pkt_ctx->height,
+                         av_get_pix_fmt_name( pkt_ctx->pix_fmt ) ? av_get_pix_fmt_name( pkt_ctx->pix_fmt ) : "none",
+                         pkt_ctx->colorspace );
+        else
+        {
+            int bits_per_sample = pkt_ctx->bits_per_raw_sample   > 0 ? pkt_ctx->bits_per_raw_sample
+                                : pkt_ctx->bits_per_coded_sample > 0 ? pkt_ctx->bits_per_coded_sample
+                                : av_get_bytes_per_sample( pkt_ctx->sample_fmt ) << 3;
+            print_index( index, "Codec=%d,TimeBase=%d/%d,Channels=%d:0x%" PRIx64 ",Rate=%d,Format=%s,BPS=%d\n",
+                         pkt_ctx->codec_id, stream->time_base.num, stream->time_base.den,
+                         pkt_ctx->channels, pkt_ctx->channel_layout, pkt_ctx->sample_rate,
+                         av_get_sample_fmt_name( pkt_ctx->sample_fmt ) ? av_get_sample_fmt_name( pkt_ctx->sample_fmt ) : "none",
+                         bits_per_sample );
+        }
+        print_index( index, "</StreamInfo>\n" );
+    }
     while( read_av_frame( format_ctx, &pkt ) >= 0 )
     {
         AVStream          *stream   = format_ctx->streams[ pkt.stream_index ];
         AVCodecParameters *codecpar = stream->codecpar;
         if( codecpar->codec_type != AVMEDIA_TYPE_VIDEO
          && codecpar->codec_type != AVMEDIA_TYPE_AUDIO )
+        {
+            stream->discard = AVDISCARD_ALL;
             continue;
+        }
         if( codecpar->codec_id == AV_CODEC_ID_NONE )
+        {
+            stream->discard = AVDISCARD_ALL;
             continue;
+        }
         lwindex_helper_t *helper = get_index_helper( &indexer, stream );
         if( !helper )
         {
@@ -2093,7 +2186,10 @@ static void create_index
         }
         AVCodecContext *pkt_ctx = helper->codec_ctx;
         if( !pkt_ctx )
+        {
+            stream->discard = AVDISCARD_ALL;
             continue;
+        }
         int extradata_index = append_extradata_if_new( helper, pkt_ctx, &pkt );
         if( extradata_index < 0 )
         {
@@ -2102,8 +2198,12 @@ static void create_index
         }
         if( pkt_ctx->codec_type == AVMEDIA_TYPE_VIDEO )
         {
-            if( pkt_ctx->pix_fmt == AV_PIX_FMT_NONE )
+            if( pkt_ctx->pix_fmt == AV_PIX_FMT_NONE
+             || (pkt_ctx->codec->wrapper_name && !pix_fmt_investigated) )
+            {
                 investigate_pix_fmt_by_decoding( pkt_ctx, &pkt, vdhp->frame_buffer );
+                pix_fmt_investigated = 1;
+            }
             int dv_in_avi_init = 0;
             if( adhp->dv_in_avi    == -1
              && vdhp->stream_index == -1
@@ -2217,8 +2317,7 @@ static void create_index
                  && (pkt_ctx->codec_id == AV_CODEC_ID_H264 || pkt_ctx->codec_id == AV_CODEC_ID_HEVC)
                  && (pkt_ctx->width == 0 || pkt_ctx->height == 0) )
                     info->flags |= LW_VFRAME_FLAG_CORRUPT;
-                if( (pkt_ctx->codec_id == AV_CODEC_ID_VP8 && check_vp8_invisible_frame( &pkt ))
-                 || (pkt_ctx->codec_id == AV_CODEC_ID_VP9 && check_vp9_invisible_frame( &pkt )) )
+                if( pkt_ctx->codec_id == AV_CODEC_ID_VP8 && check_vp8_invisible_frame( &pkt ) )
                 {
                     /* VPx invisible altref frame. */
                     info->flags |= LW_VFRAME_FLAG_INVISIBLE;
@@ -2269,17 +2368,12 @@ static void create_index
                     entry->codec_tag = pkt_ctx->codec_tag;
             }
             /* Write a video packet info to the index file. */
-            print_index( index, "Index=%d,Type=%d,Codec=%d,TimeBase=%d/%d,POS=%" PRId64 ",PTS=%" PRId64 ",DTS=%" PRId64 ",EDI=%d\n"
-                         "Key=%d,Pic=%d,POC=%d,Repeat=%d,Field=%d,Width=%d,Height=%d,Format=%s,ColorSpace=%d\n",
-                         pkt.stream_index, AVMEDIA_TYPE_VIDEO, pkt_ctx->codec_id,
-                         stream->time_base.num, stream->time_base.den,
-                         pkt.pos, pkt.pts, pkt.dts, extradata_index,
-                         !!(pkt.flags & AV_PKT_FLAG_KEY), pict_type, poc, repeat_pict, field_info,
-                         pkt_ctx->width, pkt_ctx->height,
-                         av_get_pix_fmt_name( pkt_ctx->pix_fmt ) ? av_get_pix_fmt_name( pkt_ctx->pix_fmt ) : "none",
-                         pkt_ctx->colorspace );
+            print_index( index, "Index=%d,POS=%" PRId64 ",PTS=%" PRId64 ",DTS=%" PRId64 ",EDI=%d\n"
+                         "Key=%d,Pic=%d,POC=%d,Repeat=%d,Field=%d\n",
+                         pkt.stream_index, pkt.pos, pkt.pts, pkt.dts, extradata_index,
+                         !!(pkt.flags & AV_PKT_FLAG_KEY), pict_type, poc, repeat_pict, field_info );
         }
-        else
+        else if( adhp->stream_index != -2 )
         {
             if( adhp->stream_index == -1 && (!opt->force_audio || (opt->force_audio && pkt.stream_index == opt->force_audio_index)) )
             {
@@ -2372,24 +2466,22 @@ static void create_index
                     entry->codec_tag = pkt_ctx->codec_tag;
             }
             /* Write an audio packet info to the index file. */
-            print_index( index, "Index=%d,Type=%d,Codec=%d,TimeBase=%d/%d,POS=%" PRId64 ",PTS=%" PRId64 ",DTS=%" PRId64 ",EDI=%d\n"
-                         "Channels=%d:0x%" PRIx64 ",Rate=%d,Format=%s,BPS=%d,Length=%d\n",
-                         pkt.stream_index, AVMEDIA_TYPE_AUDIO, pkt_ctx->codec_id,
-                         stream->time_base.num, stream->time_base.den,
-                         pkt.pos, pkt.pts, pkt.dts, extradata_index,
-                         pkt_ctx->channels, pkt_ctx->channel_layout, pkt_ctx->sample_rate,
-                         av_get_sample_fmt_name( pkt_ctx->sample_fmt ) ? av_get_sample_fmt_name( pkt_ctx->sample_fmt ) : "none",
-                         bits_per_sample, frame_length );
+            print_index( index, "Index=%d,POS=%" PRId64 ",PTS=%" PRId64 ",DTS=%" PRId64 ",EDI=%d\n"
+                         "Length=%d\n",
+                         pkt.stream_index, pkt.pos, pkt.pts, pkt.dts, extradata_index,
+                         frame_length );
         }
+        else
+            stream->discard = AVDISCARD_ALL;
         if( indicator->update )
         {
             /* Update progress dialog. */
             int percent = 0;
             if( first_dts == AV_NOPTS_VALUE )
                 first_dts = pkt.dts;
-            if( filesize > 0 && pkt.pos > 0 )
-                /* Update if packet's file offset is valid. */
-                percent = (int)(100.0 * ((double)pkt.pos / filesize) + 0.5);
+            if( filesize > 0 && format_ctx->pb->pos > 0 )
+                /* Update if IO context's file offset is valid. */
+                percent = (int)(100.0 * ((double)format_ctx->pb->pos / filesize) + 0.5);
             else if( format_ctx->duration > 0 && first_dts != AV_NOPTS_VALUE && pkt.dts != AV_NOPTS_VALUE )
                 /* Update if packet's DTS is valid. */
                 percent = (int)(100.0
@@ -2435,12 +2527,9 @@ static void create_index
                      && audio_info[audio_frame_number].length != audio_info[audio_frame_number - 1].length )
                         constant_frame_length = 0;
                 }
-                print_index( index, "Index=%d,Type=%d,Codec=%d,TimeBase=%d/%d,POS=-1,PTS=%" PRId64 ",DTS=%" PRId64 ",EDI=-1\n"
-                             "Channels=0:0x0,Rate=0,Format=none,BPS=0,Length=%d\n",
-                             stream_index, AVMEDIA_TYPE_AUDIO, pkt_ctx->codec_id,
-                             format_ctx->streams[stream_index]->time_base.num,
-                             format_ctx->streams[stream_index]->time_base.den,
-                             AV_NOPTS_VALUE, AV_NOPTS_VALUE, frame_length );
+                print_index( index, "Index=%d,POS=-1,PTS=%" PRId64 ",DTS=%" PRId64 ",EDI=-1\n"
+                             "Length=%d\n",
+                             stream_index, AV_NOPTS_VALUE, AV_NOPTS_VALUE, frame_length );
             }
         }
     }
@@ -2699,23 +2788,36 @@ static int parse_index
     FILE                           *index
 )
 {
-    /* Test to open the target file. */
-    char file_path[512] = { 0 };
-    if( fscanf( index, "<InputFilePath>%[^\n<]</InputFilePath>\n", file_path ) != 1 )
-        return -1;
-    FILE *target = lw_fopen( file_path, "rb" );
-    if( !target )
-        return -1;
-    fclose( target );
-    size_t file_path_length = strlen( file_path );
-    lwhp->file_path = (char *)lw_malloc_zero( file_path_length + 1 );
-    if( !lwhp->file_path )
-        return -1;
-    memcpy( lwhp->file_path, file_path, file_path_length );
     /* Parse the index file. */
+    int64_t file_size;
+    unsigned file_hash;
     char format_name[256];
     int active_video_index;
     int active_audio_index;
+#ifdef _WIN32
+    wchar_t *wname;
+    struct _stat64 file_stat;
+    if( lw_string_to_wchar( CP_UTF8, lwhp->file_path, &wname ) )
+    {
+        if( _wstat64( wname, &file_stat ) )
+            return -1;
+    }
+    else
+    {
+        if( _stat64( lwhp->file_path, &file_stat ) )
+            return -1;
+    }
+#else
+    struct stat file_stat;
+    if( stat( lwhp->file_path, &file_stat ) )
+        return -1;
+#endif
+    if( fscanf( index, "<FileSize=%" SCNd64 ">\n", &file_size ) != 1
+     || file_size != file_stat.st_size )
+        return -1;
+    if( fscanf( index, "<FileHash=0x%x>\n", &file_hash ) != 1
+     || file_hash != xxhash_file( lwhp->file_path, file_stat.st_size ) )
+        return -1;
     if( fscanf( index, "<LibavReaderIndex=0x%x,%d,%[^>]>\n",
                 (unsigned int *)&lwhp->format_flags, &lwhp->raw_demuxer, format_name ) != 3 )
         return -1;
@@ -2733,6 +2835,7 @@ static int parse_index
     uint32_t audio_info_count = 1 << 16;
     video_frame_info_t *video_info = NULL;
     audio_frame_info_t *audio_info = NULL;
+    lwindex_stream_info_t *stream_info = NULL;
     if( vdhp->stream_index >= 0 )
     {
         video_info = (video_frame_info_t *)lw_malloc_zero( video_info_count * sizeof(video_frame_info_t) );
@@ -2745,6 +2848,8 @@ static int parse_index
         if( !audio_info )
             goto fail_parsing;
     }
+    if( active_audio_index == -2 && opt->force_audio_index >= -1 )
+        goto fail_parsing;
     vdhp->codec_id             = AV_CODEC_ID_NONE;
     adhp->codec_id             = AV_CODEC_ID_NONE;
     vdhp->initial_pix_fmt      = AV_PIX_FMT_NONE;
@@ -2758,23 +2863,58 @@ static int parse_index
     int      constant_frame_length = 1;
     uint64_t audio_duration        = 0;
     char buf[1024];
-    while( fgets( buf, sizeof(buf), index ) )
+    if( !fgets( buf, sizeof(buf), index ) )
+        goto fail_parsing;
+    while( !strncmp( buf, "<StreamInfo=", strlen( "<StreamInfo=" ) ) )
     {
         int stream_index;
         int codec_type;
-        int codec_id;
+        if( sscanf( buf, "<StreamInfo=%d,%d>", &stream_index, &codec_type ) != 2 )
+            goto fail_parsing;
+        if( !fgets( buf, sizeof(buf), index ) )
+            goto fail_parsing;
+        lwindex_stream_info_t *temp = (lwindex_stream_info_t *)realloc( stream_info, (stream_index + 1) * sizeof(lwindex_stream_info_t) );
+        if( !temp )
+            goto fail_parsing;
+        stream_info = temp;
+        lwindex_stream_info_t *info = &stream_info[stream_index];
+        info->codec_type = codec_type;
+        if( codec_type == AVMEDIA_TYPE_VIDEO )
+        {
+            if( sscanf( buf, "Codec=%d,TimeBase=%d/%d,Width=%d,Height=%d,Format=%[^,],ColorSpace=%d",
+                        &info->codec_id, &info->time_base.num, &info->time_base.den, &info->width, &info->height, info->fmt, &info->colorspace ) != 7 )
+                goto fail_parsing;
+        }
+        else if( codec_type == AVMEDIA_TYPE_AUDIO )
+        {
+            if( sscanf( buf, "Codec=%d,TimeBase=%d/%d,Channels=%d:0x%" SCNx64 ",Rate=%d,Format=%[^,],BPS=%d",
+                        &info->codec_id, &info->time_base.num, &info->time_base.den, &info->channels, &info->layout, &info->sample_rate, info->fmt, &info->bits_per_sample ) != 8 )
+                goto fail_parsing;
+        }
+        if( !fgets( buf, sizeof(buf), index ) )
+            goto fail_parsing;
+        if( strncmp( buf, "</StreamInfo>", strlen( "</StreamInfo>" ) ) )
+            goto fail_parsing;
+        if( !fgets( buf, sizeof(buf), index ) )
+            goto fail_parsing;
+    }
+    while( !strncmp( buf, "Index=", strlen( "Index=" ) ) )
+    {
+        int stream_index;
         int extradata_index;
-        AVRational time_base;
         int64_t pos;
         int64_t pts;
         int64_t dts;
-        if( sscanf( buf, "Index=%d,Type=%d,Codec=%d,TimeBase=%d/%d,POS=%" SCNd64 ",PTS=%" SCNd64 ",DTS=%" SCNd64 ",EDI=%d",
-                    &stream_index, &codec_type, &codec_id, &time_base.num, &time_base.den, &pos, &pts, &dts, &extradata_index ) != 9 )
-            break;
+        if( sscanf( buf, "Index=%d,POS=%" SCNd64 ",PTS=%" SCNd64 ",DTS=%" SCNd64 ",EDI=%d",
+                    &stream_index, &pos, &pts, &dts, &extradata_index ) != 5 )
+            goto fail_parsing;
+        if( !fgets( buf, sizeof(buf), index ) )
+            goto fail_parsing;
+        int        codec_type = stream_info[stream_index].codec_type;
+        int        codec_id   = stream_info[stream_index].codec_id;
+        AVRational time_base  = stream_info[stream_index].time_base;
         if( codec_type == AVMEDIA_TYPE_VIDEO )
         {
-            if( !fgets( buf, sizeof(buf), index ) )
-                goto fail_parsing;
             if( adhp->dv_in_avi == -1 && codec_id == AV_CODEC_ID_DVVIDEO && !opt->force_audio )
             {
                 adhp->dv_in_avi = 1;
@@ -2788,17 +2928,17 @@ static int parse_index
             }
             if( stream_index == vdhp->stream_index )
             {
-                int pict_type;
-                int poc;
-                int repeat_pict;
-                int field_info;
-                int key;
-                int width;
-                int height;
-                int colorspace;
-                char pix_fmt[64];
-                if( sscanf( buf, "Key=%d,Pic=%d,POC=%d,Repeat=%d,Field=%d,Width=%d,Height=%d,Format=%[^,],ColorSpace=%d",
-                            &key, &pict_type, &poc, &repeat_pict, &field_info, &width, &height, pix_fmt, &colorspace ) != 9 )
+                int   width      = stream_info[stream_index].width;
+                int   height     = stream_info[stream_index].height;
+                char *pix_fmt    = stream_info[stream_index].fmt;
+                int   colorspace = stream_info[stream_index].colorspace;
+                int   key;
+                int   pict_type;
+                int   poc;
+                int   repeat_pict;
+                int   field_info;
+                if( sscanf( buf, "Key=%d,Pic=%d,POC=%d,Repeat=%d,Field=%d",
+                            &key, &pict_type, &poc, &repeat_pict, &field_info ) != 5 )
                     goto fail_parsing;
                 if( vdhp->codec_id == AV_CODEC_ID_NONE )
                     vdhp->codec_id = (enum AVCodecID)codec_id;
@@ -2819,7 +2959,7 @@ static int parse_index
                             vdhp->max_height = height;
                     }
                     if( vdhp->initial_pix_fmt == AV_PIX_FMT_NONE )
-                        vdhp->initial_pix_fmt = av_get_pix_fmt( (const char *)pix_fmt );
+                        vdhp->initial_pix_fmt = av_get_pix_fmt( pix_fmt );
                     if( vdhp->initial_colorspace == AVCOL_SPC_NB )
                         vdhp->initial_colorspace = (enum AVColorSpace)colorspace;
                     if( vdhp->time_base.num == 0 || vdhp->time_base.den == 0 )
@@ -2846,11 +2986,11 @@ static int parse_index
                         last_keyframe_pts = pts;
                     }
                     if( repeat_pict == 0 && field_info == LW_FIELD_INFO_UNKNOWN
-                     && av_get_pix_fmt( (const char *)pix_fmt ) == AV_PIX_FMT_NONE
+                     && av_get_pix_fmt( pix_fmt ) == AV_PIX_FMT_NONE
                      && ((enum AVCodecID)codec_id == AV_CODEC_ID_H264 || (enum AVCodecID)codec_id == AV_CODEC_ID_HEVC)
                      && (width == 0 || height == 0) )
                         info->flags |= LW_VFRAME_FLAG_CORRUPT;
-                    if( ((enum AVCodecID)codec_id == AV_CODEC_ID_VP8 || (enum AVCodecID)codec_id == AV_CODEC_ID_VP9)
+                    if( (enum AVCodecID)codec_id == AV_CODEC_ID_VP8
                      && pts == AV_NOPTS_VALUE && dts == AV_NOPTS_VALUE && pos == -1 )
                     {
                         /* VPx invisible altref frame. */
@@ -2870,22 +3010,19 @@ static int parse_index
         }
         else if( codec_type == AVMEDIA_TYPE_AUDIO )
         {
-            if( !fgets( buf, sizeof(buf), index ) )
-                goto fail_parsing;
             if( stream_index == adhp->stream_index )
             {
-                uint64_t layout;
-                int      channels;
-                int      sample_rate;
-                char     sample_fmt[64];
-                int      bits_per_sample;
+                uint64_t layout          = stream_info[stream_index].layout;
+                int      channels        = stream_info[stream_index].channels;
+                int      sample_rate     = stream_info[stream_index].sample_rate;
+                char    *sample_fmt      = stream_info[stream_index].fmt;
+                int      bits_per_sample = stream_info[stream_index].bits_per_sample;
                 int      frame_length;
-                if( sscanf( buf, "Channels=%d:0x%" SCNx64 ",Rate=%d,Format=%[^,],BPS=%d,Length=%d",
-                            &channels, &layout, &sample_rate, sample_fmt, &bits_per_sample, &frame_length ) != 6 )
+                if( sscanf( buf, "Length=%d", &frame_length ) != 1 )
                     goto fail_parsing;
                 if( adhp->codec_id == AV_CODEC_ID_NONE )
                     adhp->codec_id = (enum AVCodecID)codec_id;
-                if( (channels | layout | sample_rate | bits_per_sample) && audio_duration <= INT32_MAX )
+                if( (channels | layout | sample_rate | bits_per_sample) && extradata_index != -1 && audio_duration <= INT32_MAX )
                 {
                     if( audio_sample_rate == 0 )
                         audio_sample_rate = sample_rate;
@@ -2900,7 +3037,7 @@ static int parse_index
                       > av_get_channel_layout_nb_channels( aohp->output_channel_layout ) )
                         aohp->output_channel_layout = layout;
                     aohp->output_sample_format   = select_better_sample_format( aohp->output_sample_format,
-                                                                                av_get_sample_fmt( (const char *)sample_fmt ) );
+                                                                                av_get_sample_fmt( sample_fmt ) );
                     aohp->output_sample_rate     = MAX( aohp->output_sample_rate, audio_sample_rate );
                     aohp->output_bits_per_sample = MAX( aohp->output_bits_per_sample, bits_per_sample );
                     ++audio_sample_count;
@@ -2943,6 +3080,8 @@ static int parse_index
                 }
             }
         }
+        if( !fgets( buf, sizeof(buf), index ) )
+            goto fail_parsing;
     }
     if( video_present && opt->force_video && opt->force_video_index != -1
      && (video_sample_count == 0 || vdhp->initial_pix_fmt == AV_PIX_FMT_NONE || vdhp->initial_width == 0 || vdhp->initial_height == 0) )
@@ -3174,6 +3313,7 @@ static int parse_index
             fprintf( index, "<ActiveVideoStreamIndex>%+011d</ActiveVideoStreamIndex>\n", vdhp->stream_index );
             fprintf( index, "<ActiveAudioStreamIndex>%+011d</ActiveAudioStreamIndex>\n", adhp->stream_index );
         }
+        free( stream_info );
         return 0;
     }
 fail_parsing:
@@ -3183,6 +3323,7 @@ fail_parsing:
         free( video_info );
     if( audio_info )
         free( audio_info );
+    free( stream_info );
     return -1;
 }
 
@@ -3201,21 +3342,24 @@ int lwlibav_construct_index
 {
     /* Try to open the index file. */
     size_t file_path_length = strlen( opt->file_path );
-    char *index_file_path = (char *)lw_malloc_zero(file_path_length + 5);
-    if( !index_file_path )
-        return -1;
-    memcpy( index_file_path, opt->file_path, file_path_length );
-    const char *ext = file_path_length >= 5 ? &opt->file_path[file_path_length - 4] : NULL;
-    int has_lwi_ext = ext && !strncmp( ext, ".lwi", strlen( ".lwi" ) );
-    if( has_lwi_ext )
-        index_file_path[file_path_length] = '\0';
+    lwhp->file_path = (char *)lw_malloc_zero( file_path_length + 1 );
+    if( !lwhp->file_path )
+        goto fail;
+    memcpy( lwhp->file_path, opt->file_path, file_path_length );
+    FILE *index;
+    if( opt->index_file_path && *opt->index_file_path )
+        index = lw_fopen( opt->index_file_path, (opt->force_video || opt->force_audio) ? "r+b" : "rb" );
     else
     {
+        char *index_file_path = (char *)lw_malloc_zero(file_path_length + 5);
+        if( !index_file_path )
+            return -1;
+        memcpy( index_file_path, opt->file_path, file_path_length );
         memcpy( index_file_path + file_path_length, ".lwi", strlen( ".lwi" ) );
         index_file_path[file_path_length + 4] = '\0';
+        index = lw_fopen( index_file_path, (opt->force_video || opt->force_audio) ? "r+b" : "rb" );
+        free( index_file_path );
     }
-    FILE *index = lw_fopen( index_file_path, (opt->force_video || opt->force_audio) ? "r+b" : "rb" );
-    free( index_file_path );
     if( index )
     {
         uint8_t lwindex_version[4] = { 0 };
@@ -3229,25 +3373,12 @@ int lwlibav_construct_index
         {
             /* Opening and parsing the index file succeeded. */
             fclose( index );
-            av_register_all();
-            avcodec_register_all();
             lwhp->threads = opt->threads;
             return 0;
         }
         fclose( index );
     }
     /* Open file. */
-    if( !lwhp->file_path )
-    {
-        lwhp->file_path = (char *)lw_malloc_zero( file_path_length + 1 );
-        if( !lwhp->file_path )
-            goto fail;
-        memcpy( lwhp->file_path, opt->file_path, file_path_length );
-        if( has_lwi_ext )
-            lwhp->file_path[file_path_length - 4] = '\0';
-    }
-    av_register_all();
-    avcodec_register_all();
     AVFormatContext *format_ctx = NULL;
     if( lavf_open_file( &format_ctx, lwhp->file_path, lhp ) )
     {
@@ -3257,7 +3388,7 @@ int lwlibav_construct_index
     }
     lwhp->threads      = opt->threads;
     vdhp->stream_index = -1;
-    adhp->stream_index = -1;
+    adhp->stream_index = ( opt->force_audio_index == -2 ) ? -2 : -1;
     /* Create the index file. */
     create_index( lwhp, vdhp, vohp, adhp, aohp, format_ctx, opt, indicator, php );
     /* Close file.

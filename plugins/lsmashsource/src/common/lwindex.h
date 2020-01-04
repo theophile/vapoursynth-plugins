@@ -27,7 +27,7 @@
 /* index file version
  * This version is bumped when its structure changed so that the lwindex invokes
  * reindexing opened file immediately. */
-#define LWINDEX_INDEX_FILE_VERSION 13
+#define LWINDEX_INDEX_FILE_VERSION 16
 
 typedef struct
 {
@@ -35,6 +35,7 @@ typedef struct
     int         threads;
     int         av_sync;
     int         no_create_index;
+    const char *index_file_path;
     int         force_video;
     int         force_video_index;
     int         force_audio;

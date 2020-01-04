@@ -24,11 +24,18 @@
 /* L-SMASH (ISC) */
 #include <lsmash.h>                 /* Demuxer */
 
+#ifdef __cplusplus
+extern "C"
+{
+#endif  /* __cplusplus */
 /* Libav (LGPL or GPL) */
 #include <libavformat/avformat.h>       /* Codec specific info importer */
 #include <libavcodec/avcodec.h>         /* Decoder */
 #include <libswscale/swscale.h>         /* Colorspace converter */
 #include <libavutil/imgutils.h>
+#ifdef __cplusplus
+}
+#endif  /* __cplusplus */
 
 #include "lsmashsource.h"
 #include "video_output.h"
@@ -71,7 +78,7 @@ static lsmas_handler_t *alloc_handler
     void
 )
 {
-    lsmas_handler_t *hp = lw_malloc_zero( sizeof(lsmas_handler_t) );
+    lsmas_handler_t *hp = (lsmas_handler_t *)lw_malloc_zero( sizeof(lsmas_handler_t) );
     if( !hp )
         return NULL;
     hp->vdhp = libavsmash_video_alloc_decode_handler();
@@ -157,7 +164,7 @@ static void set_frame_properties
     int64_t duration_num;
     int64_t duration_den;
     get_sample_duration( vdhp, vi, sample_number, &duration_num, &duration_den );
-    vs_set_frame_properties( av_frame, duration_num, duration_den, vs_frame, vsapi );
+    vs_set_frame_properties( av_frame, NULL, duration_num, duration_den, vs_frame, vsapi );
 }
 
 static int prepare_video_decoding
@@ -315,7 +322,8 @@ void VS_CC vs_libavsmashsource_create( const VSMap *in, VSMap *out, void *user_d
     uint32_t number_of_tracks = open_file( hp, file_name, &lh );
     if( number_of_tracks == 0 )
     {
-        vs_filter_free( hp, core, vsapi );
+        free_handler( &hp );
+        vsapi->setError( out, "lsmas: failed to open file." );
         return;
     }
     /* Get options. */
@@ -327,6 +335,8 @@ void VS_CC vs_libavsmashsource_create( const VSMap *in, VSMap *out, void *user_d
     int64_t direct_rendering;
     int64_t fps_num;
     int64_t fps_den;
+    int64_t prefer_hw_decoder;
+    int64_t ff_loglevel;
     const char *format;
     const char *preferred_decoder_names;
     set_option_int64 ( &track_number,            0,    "track",          in, vsapi );
@@ -337,39 +347,60 @@ void VS_CC vs_libavsmashsource_create( const VSMap *in, VSMap *out, void *user_d
     set_option_int64 ( &direct_rendering,        0,    "dr",             in, vsapi );
     set_option_int64 ( &fps_num,                 0,    "fpsnum",         in, vsapi );
     set_option_int64 ( &fps_den,                 1,    "fpsden",         in, vsapi );
+    set_option_int64 ( &prefer_hw_decoder,       0,    "prefer_hw",      in, vsapi );
+    set_option_int64 ( &ff_loglevel,             0,    "ff_loglevel",    in, vsapi );
     set_option_string( &format,                  NULL, "format",         in, vsapi );
     set_option_string( &preferred_decoder_names, NULL, "decoder",        in, vsapi );
     set_preferred_decoder_names_on_buf( hp->preferred_decoder_names_buf, preferred_decoder_names );
     libavsmash_video_set_seek_mode              ( vdhp, CLIP_VALUE( seek_mode,      0, 2 ) );
     libavsmash_video_set_forward_seek_threshold ( vdhp, CLIP_VALUE( seek_threshold, 1, 999 ) );
     libavsmash_video_set_preferred_decoder_names( vdhp, tokenize_preferred_decoder_names( hp->preferred_decoder_names_buf ) );
+    libavsmash_video_set_prefer_hw_decoder      ( vdhp, CLIP_VALUE( prefer_hw_decoder, 0, 3 ) );
     vohp->vfr2cfr = (fps_num > 0 && fps_den > 0);
     vohp->cfr_num = (uint32_t)fps_num;
     vohp->cfr_den = (uint32_t)fps_den;
     vs_vohp->variable_info               = CLIP_VALUE( variable_info,  0, 1 );
     vs_vohp->direct_rendering            = CLIP_VALUE( direct_rendering,  0, 1 ) && !format;
     vs_vohp->vs_output_pixel_format = vs_vohp->variable_info ? pfNone : get_vs_output_pixel_format( format );
+    if( ff_loglevel <= 0 )
+        av_log_set_level( AV_LOG_QUIET );
+    else if( ff_loglevel == 1 )
+        av_log_set_level( AV_LOG_PANIC );
+    else if( ff_loglevel == 2 )
+        av_log_set_level( AV_LOG_FATAL );
+    else if( ff_loglevel == 3 )
+        av_log_set_level( AV_LOG_ERROR );
+    else if( ff_loglevel == 4 )
+        av_log_set_level( AV_LOG_WARNING );
+    else if( ff_loglevel == 5 )
+        av_log_set_level( AV_LOG_INFO );
+    else if( ff_loglevel == 6 )
+        av_log_set_level( AV_LOG_VERBOSE );
+    else if( ff_loglevel == 7 )
+        av_log_set_level( AV_LOG_DEBUG );
+    else
+        av_log_set_level( AV_LOG_TRACE );
     if( track_number && track_number > number_of_tracks )
     {
-        vs_filter_free( hp, core, vsapi );
-        set_error_on_init( out, vsapi, "lsmas: the number of tracks equals %"PRIu32".", number_of_tracks );
+        free_handler( &hp );
+        set_error_on_init( out, vsapi, "lsmas: the number of tracks equals %" PRIu32 ".", number_of_tracks );
         return;
     }
     libavsmash_video_set_log_handler( vdhp, &lh );
     /* Get video track. */
     if( libavsmash_video_get_track( vdhp, track_number ) < 0 )
     {
-        vs_filter_free( hp, core, vsapi );
+        free_handler( &hp );
+        vsapi->setError( out, "lsmas: failed to get video track." );
         return;
     }
     /* Set up decoders for this track. */
     threads = threads >= 0 ? threads : 0;
     if( prepare_video_decoding( hp, threads, out, core, vsapi ) < 0 )
     {
-        vs_filter_free( hp, core, vsapi );
+        free_handler( &hp );
         return;
     }
     lsmash_discard_boxes( libavsmash_video_get_root( vdhp ) );
     vsapi->createFilter( in, out, "LibavSMASHSource", vs_filter_init, vs_filter_get_frame, vs_filter_free, fmUnordered, nfMakeLinear, hp, core );
-    return;
 }
