@@ -21,6 +21,7 @@
 
 #include <VSHelper.h>
 
+#include "CPU.h"
 #include "MVFrame.h"
 
 #ifndef max
@@ -30,8 +31,6 @@
 #ifndef min
 #define min(a, b) (((a) < (b)) ? (a) : (b))
 #endif
-
-
 
 #if defined(MVTOOLS_X86)
 
@@ -49,6 +48,18 @@
    extern "C" void  RB2FilteredVerticalLine_SSE(uint8_t *pDst, const uint8_t *pSrc, intptr_t nSrcPitch, intptr_t nWidthMMX);
    extern "C" void  RB2FilteredHorizontalInplaceLine_SSE(uint8_t *pSrc, intptr_t nWidthMMX);
    */
+
+void Average2_avx2(uint8_t *pDst, const uint8_t *pSrc1, const uint8_t *pSrc2, intptr_t nPitch, intptr_t nWidth, intptr_t nHeight);
+void VerticalBilinear_avx2(uint8_t *pDst, const uint8_t *pSrc, intptr_t nPitch,
+                           intptr_t nWidth, intptr_t nHeight, intptr_t bitsPerSample);
+void HorizontalBilinear_avx2(uint8_t *pDst, const uint8_t *pSrc, intptr_t nPitch,
+                             intptr_t nWidth, intptr_t nHeight, intptr_t bitsPerSample);
+void DiagonalBilinear_avx2(uint8_t *pDst, const uint8_t *pSrc, intptr_t nPitch,
+                           intptr_t nWidth, intptr_t nHeight, intptr_t bitsPerSample);
+void VerticalWiener_avx2(uint8_t *pDst, const uint8_t *pSrc, intptr_t nPitch,
+                         intptr_t nWidth, intptr_t nHeight, intptr_t bitsPerSample);
+void HorizontalWiener_avx2(uint8_t *pDst, const uint8_t *pSrc, intptr_t nPitch,
+                           intptr_t nWidth, intptr_t nHeight, intptr_t bitsPerSample) ;
 
 static void Average2_sse2(uint8_t *pDst, const uint8_t *pSrc1, const uint8_t *pSrc2, intptr_t nPitch, intptr_t nWidth, intptr_t nHeight) {
     for (int y = 0; y < nHeight; y++) {
@@ -1388,6 +1399,12 @@ void mvpRefine(MVPlane *mvp, int sharp) {
                 refine[0] = HorizontalBilinear_sse2;
                 refine[1] = VerticalBilinear_sse2;
                 refine[2] = DiagonalBilinear_sse2;
+
+                if (mvp->opt >= MVOPT_AVX2 && (g_cpuinfo & X264_CPU_AVX2)) {
+                    refine[0] = HorizontalBilinear_avx2;
+                    refine[1] = VerticalBilinear_avx2;
+                    refine[2] = DiagonalBilinear_avx2;
+                }
 #endif
             }
         } else {
@@ -1420,6 +1437,11 @@ void mvpRefine(MVPlane *mvp, int sharp) {
 #if defined(MVTOOLS_X86)
                 refine[0] = refine[2] = HorizontalWiener_sse2;
                 refine[1] = VerticalWiener_sse2;
+
+                if (mvp->opt >= MVOPT_AVX2 && (g_cpuinfo & X264_CPU_AVX2)) {
+                    refine[0] = refine[2] = HorizontalWiener_avx2;
+                    refine[1] = VerticalWiener_avx2;
+                }
 #endif
             }
         } else {
@@ -1465,6 +1487,9 @@ void mvpRefine(MVPlane *mvp, int sharp) {
             if (mvp->opt) {
 #if defined(MVTOOLS_X86)
                 avg = Average2_sse2;
+
+                if (mvp->opt >= MVOPT_AVX2 && (g_cpuinfo & X264_CPU_AVX2))
+                    avg = Average2_avx2;
 #endif
             }
         } else {
@@ -1523,7 +1548,7 @@ static void mvpRefineExtPel2(MVPlane *mvp, const uint8_t *pSrc2x8, int nSrc2xPit
 
     if (!isExtPadded) {
         for (int i = 1; i < 4; i++)
-            PadReferenceFrame<PixelType>(mvp->pPlane[1], mvp->nPitch, mvp->nHPadding, mvp->nVPadding, mvp->nWidth, mvp->nHeight);
+            PadReferenceFrame<PixelType>(mvp->pPlane[i], mvp->nPitch, mvp->nHPadding, mvp->nVPadding, mvp->nWidth, mvp->nHeight);
     }
 
     mvp->isPadded = 1;
