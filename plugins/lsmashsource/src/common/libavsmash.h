@@ -48,7 +48,6 @@ typedef struct
     uint8_t              *input_buffer;
     AVCodecContext       *ctx;
     const char          **preferred_decoder_names;
-    int                   prefer_hw_decoder;
     libavsmash_summary_t *entries;
     extended_summary_t    prefer;
     lw_log_handler_t      lh;
@@ -96,9 +95,10 @@ int get_summaries
 
 int libavsmash_find_and_open_decoder
 (
-    codec_configuration_t *config,
-    const AVStream        *stream,
-    const int              thread_count
+    codec_configuration_t   *config,
+    const AVCodecParameters *codecpar,
+    const int                thread_count,
+    const int                refcounted_frames
 );
 
 int initialize_decoder_configuration

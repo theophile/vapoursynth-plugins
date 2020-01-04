@@ -20,53 +20,22 @@
 
 /* This file is available under an ISC license. */
 
-#ifdef _MSC_VER
 #include <string.h>
-#define strcasecmp _stricmp
-#else
-#include <strings.h>
-#endif
 
-#ifdef __cplusplus
-extern "C"
-{
-#endif  /* __cplusplus */
 /* Libav */
-#include <libavformat/avformat.h>       /* Demuxer */
 #include <libavcodec/avcodec.h>         /* Decoder */
 #include <libswscale/swscale.h>         /* Colorspace converter */
 #include <libavutil/imgutils.h>
 #include <libavutil/mem.h>
-#include <libavutil/mastering_display_metadata.h>
-#ifdef __cplusplus
-}
-#endif  /* __cplusplus */
 
 #include "lsmashsource.h"
 #include "video_output.h"
-
-#include <emmintrin.h>
-
-#if (LIBAVUTIL_VERSION_MICRO >= 100) && (LIBSWSCALE_VERSION_MICRO >= 100)
-#define FFMPEG_HIGH_DEPTH_SUPPORT 1
-#else
-#define FFMPEG_HIGH_DEPTH_SUPPORT 0
-#endif
 
 typedef struct
 {
     uint8_t *data    [4];
     int      linesize[4];
 } vs_picture_t;
-
-static inline __m128i _MM_PACKUS_EPI32( const __m128i *low, const __m128i *high )
-{
-    const __m128i val_32 = _mm_set1_epi32( 0x8000 );
-    const __m128i val_16 = _mm_set1_epi16( 0x8000 );
-    const __m128i low1   = _mm_sub_epi32( *low, val_32 );
-    const __m128i high1  = _mm_sub_epi32( *high, val_32 );
-    return _mm_add_epi16( _mm_packs_epi32( low1, high1 ), val_16 );
-}
 
 static void make_black_background_planar_yuv8
 (
@@ -110,15 +79,6 @@ static void make_black_background_planar_rgb
         memset( vsapi->getWritePtr( vs_frame, i ), 0x00, vsapi->getStride( vs_frame, i ) * vsapi->getFrameHeight( vs_frame, i ) );
 }
 
-static void make_black_background_planar_gray
-(
-    VSFrameRef  *vs_frame,
-    const VSAPI *vsapi
-)
-{
-    memset( vsapi->getWritePtr( vs_frame, 0 ), 0x00, vsapi->getStride( vs_frame, 0 ) * vsapi->getFrameHeight( vs_frame, 0 ) );
-}
-
 static void make_frame_planar_yuv
 (
     lw_video_scaler_handler_t *vshp,
@@ -146,61 +106,7 @@ static void make_frame_planar_yuv
             0
         }
     };
-    if( vshp->input_pixel_format == AV_PIX_FMT_P010LE && vshp->output_pixel_format == AV_PIX_FMT_YUV420P10LE )
-    {
-        const int width_y       = vsapi->getFrameWidth( vs_frame, 0 );
-        const int width_uv      = vsapi->getFrameWidth( vs_frame, 1 );
-        const int height_y      = vsapi->getFrameHeight( vs_frame, 0 );
-        const int height_uv     = vsapi->getFrameHeight( vs_frame, 1 );
-        const int src_stride_y  = av_picture->linesize[0] / sizeof( uint16_t );
-        const int src_stride_uv = av_picture->linesize[1] / sizeof( uint16_t );
-        const int dst_stride_y  = vs_picture.linesize[0] / sizeof( uint16_t );
-        const int dst_stride_uv = vs_picture.linesize[1] / sizeof( uint16_t );
-        uint16_t *srcp_y        = (uint16_t *)av_picture->data[0];
-        uint16_t *srcp_uv       = (uint16_t *)av_picture->data[1];
-        uint16_t *dstp_y        = (uint16_t *)vs_picture.data[0];
-        uint16_t *dstp_u        = (uint16_t *)vs_picture.data[1];
-        uint16_t *dstp_v        = (uint16_t *)vs_picture.data[2];
-
-        for( int y = 0; y < height_y; y++ )
-        {
-            for( int x = 0; x < width_y; x += 8 )
-            {
-                __m128i yy = _mm_load_si128( (const __m128i *)(srcp_y + x) );
-                yy         = _mm_srli_epi16( yy, 6 );
-                _mm_stream_si128( (__m128i *)(dstp_y + x), yy );
-            }
-            srcp_y += src_stride_y;
-            dstp_y += dst_stride_y;
-        }
-
-        const __m128i mask = _mm_set1_epi32(0x0000FFFF);
-        for( int y = 0; y < height_uv; y++ )
-        {
-            for( int x = 0; x < width_uv; x += 8 )
-            {
-                __m128i uv_low  = _mm_load_si128( (__m128i *)((uint32_t *)srcp_uv + x + 0) );
-                __m128i uv_high = _mm_load_si128( (__m128i *)((uint32_t *)srcp_uv + x + 4) );
-
-                __m128i u_low  = _mm_and_si128( uv_low, mask );
-                __m128i u_high = _mm_and_si128( uv_high, mask );
-                __m128i u      = _MM_PACKUS_EPI32( &u_low, &u_high );
-                u              = _mm_srli_epi16( u, 6 );
-                _mm_stream_si128( (__m128i *)(dstp_u + x), u );
-
-                __m128i v_low  = _mm_srli_epi32( uv_low, 16 );
-                __m128i v_high = _mm_srli_epi32( uv_high, 16 );
-                __m128i v      = _MM_PACKUS_EPI32( &v_low, &v_high );
-                v              = _mm_srli_epi16( v, 6 );
-                _mm_stream_si128( (__m128i *)(dstp_v + x), v );
-            }
-            srcp_uv += src_stride_uv;
-            dstp_u  += dst_stride_uv;
-            dstp_v  += dst_stride_uv;
-        }
-    }
-    else
-        sws_scale(vshp->sws_ctx, (const uint8_t * const *)av_picture->data, av_picture->linesize, 0, av_picture->height, vs_picture.data, vs_picture.linesize);
+    sws_scale( vshp->sws_ctx, (const uint8_t* const*)av_picture->data, av_picture->linesize, 0, av_picture->height, vs_picture.data, vs_picture.linesize );
 }
 
 static void make_frame_planar_rgb
@@ -322,36 +228,6 @@ static void make_frame_planar_rgb16
     }
 }
 
-static void make_frame_planar_gray
-(
-    lw_video_scaler_handler_t *vshp,
-    AVFrame                   *av_picture,
-    const component_reorder_t *component_reorder,
-    VSFrameRef                *vs_frame,
-    VSFrameContext            *frame_ctx,
-    const VSAPI               *vsapi
-)
-{
-    vs_picture_t vs_picture =
-    {
-        /* data */
-        {
-            vsapi->getWritePtr( vs_frame, 0 ),
-            NULL,
-            NULL,
-            NULL
-        },
-        /* linesize */
-        {
-            vsapi->getStride( vs_frame, 0 ),
-            0,
-            0,
-            0
-        }
-    };
-    sws_scale( vshp->sws_ctx, (const uint8_t* const*)av_picture->data, av_picture->linesize, 0, av_picture->height, vs_picture.data, vs_picture.linesize );
-}
-
 VSPresetFormat get_vs_output_pixel_format( const char *format_name )
 {
     if( !format_name )
@@ -374,19 +250,9 @@ VSPresetFormat get_vs_output_pixel_format( const char *format_name )
             { "YUV420P10", pfYUV420P10 },
             { "YUV422P10", pfYUV422P10 },
             { "YUV444P10", pfYUV444P10 },
-#if FFMPEG_HIGH_DEPTH_SUPPORT
-            { "YUV420P12", pfYUV420P12 },
-            { "YUV422P12", pfYUV422P12 },
-            { "YUV444P12", pfYUV444P12 },
-            { "YUV420P14", pfYUV420P14 },
-            { "YUV422P14", pfYUV422P14 },
-            { "YUV444P14", pfYUV444P14 },
-#endif
             { "YUV420P16", pfYUV420P16 },
             { "YUV422P16", pfYUV422P16 },
             { "YUV444P16", pfYUV444P16 },
-            { "Y8",        pfGray8     },
-            { "Y16",       pfGray16    },
             { "RGB24",     pfRGB24     },
             { "RGB27",     pfRGB27     },
             { "RGB30",     pfRGB30     },
@@ -419,19 +285,9 @@ static enum AVPixelFormat vs_to_av_output_pixel_format( VSPresetFormat vs_output
             { pfYUV420P10, AV_PIX_FMT_YUV420P10LE },
             { pfYUV422P10, AV_PIX_FMT_YUV422P10LE },
             { pfYUV444P10, AV_PIX_FMT_YUV444P10LE },
-#if FFMPEG_HIGH_DEPTH_SUPPORT
-            { pfYUV420P12, AV_PIX_FMT_YUV420P12LE },
-            { pfYUV422P12, AV_PIX_FMT_YUV422P12LE },
-            { pfYUV444P12, AV_PIX_FMT_YUV444P12LE },
-            { pfYUV420P14, AV_PIX_FMT_YUV420P14LE },
-            { pfYUV422P14, AV_PIX_FMT_YUV422P14LE },
-            { pfYUV444P14, AV_PIX_FMT_YUV444P14LE },
-#endif
             { pfYUV420P16, AV_PIX_FMT_YUV420P16LE },
             { pfYUV422P16, AV_PIX_FMT_YUV422P16LE },
             { pfYUV444P16, AV_PIX_FMT_YUV444P16LE },
-            { pfGray8,     AV_PIX_FMT_GRAY8       },
-            { pfGray16,    AV_PIX_FMT_GRAY16LE    },
             { pfRGB24,     AV_PIX_FMT_GBRP        },
             { pfRGB27,     AV_PIX_FMT_GBRP9LE     },
             { pfRGB30,     AV_PIX_FMT_GBRP10LE    },
@@ -465,26 +321,14 @@ static const component_reorder_t *get_component_reorder( enum AVPixelFormat av_o
             { AV_PIX_FMT_YUV420P10LE, {  0,  1,  2, -1 } },
             { AV_PIX_FMT_YUV422P10LE, {  0,  1,  2, -1 } },
             { AV_PIX_FMT_YUV444P10LE, {  0,  1,  2, -1 } },
-#if FFMPEG_HIGH_DEPTH_SUPPORT
-            { AV_PIX_FMT_YUV420P12LE, {  0,  1,  2, -1 } },
-            { AV_PIX_FMT_YUV422P12LE, {  0,  1,  2, -1 } },
-            { AV_PIX_FMT_YUV444P12LE, {  0,  1,  2, -1 } },
-            { AV_PIX_FMT_YUV420P14LE, {  0,  1,  2, -1 } },
-            { AV_PIX_FMT_YUV422P14LE, {  0,  1,  2, -1 } },
-            { AV_PIX_FMT_YUV444P14LE, {  0,  1,  2, -1 } },
-#endif
             { AV_PIX_FMT_YUV420P16LE, {  0,  1,  2, -1 } },
             { AV_PIX_FMT_YUV422P16LE, {  0,  1,  2, -1 } },
             { AV_PIX_FMT_YUV444P16LE, {  0,  1,  2, -1 } },
-            /* Gray */
-            { AV_PIX_FMT_GRAY8,       {  0, -1, -1, -1 } },
-            { AV_PIX_FMT_GRAY16LE,    {  0, -1, -1, -1 } },
             /* RGB */
             { AV_PIX_FMT_GBRP,        {  1,  2,  0, -1 } },
             { AV_PIX_FMT_GBRP9LE,     {  1,  2,  0, -1 } },
             { AV_PIX_FMT_GBRP10LE,    {  1,  2,  0, -1 } },
             { AV_PIX_FMT_GBRP16LE,    {  1,  2,  0, -1 } },
-            { AV_PIX_FMT_BGR24,       {  2,  1,  0, -1 } },
             { AV_PIX_FMT_RGB24,       {  0,  1,  2, -1 } },
             { AV_PIX_FMT_ARGB,        {  1,  2,  3,  0 } },
             { AV_PIX_FMT_RGBA,        {  0,  1,  2,  3 } },
@@ -529,19 +373,9 @@ static inline int set_frame_maker
             { pfYUV420P10, 0, make_black_background_planar_yuv16, make_frame_planar_yuv   },
             { pfYUV422P10, 0, make_black_background_planar_yuv16, make_frame_planar_yuv   },
             { pfYUV444P10, 0, make_black_background_planar_yuv16, make_frame_planar_yuv   },
-#if FFMPEG_HIGH_DEPTH_SUPPORT
-            { pfYUV420P12, 0, make_black_background_planar_yuv16, make_frame_planar_yuv   },
-            { pfYUV422P12, 0, make_black_background_planar_yuv16, make_frame_planar_yuv   },
-            { pfYUV444P12, 0, make_black_background_planar_yuv16, make_frame_planar_yuv   },
-            { pfYUV420P14, 0, make_black_background_planar_yuv16, make_frame_planar_yuv   },
-            { pfYUV422P14, 0, make_black_background_planar_yuv16, make_frame_planar_yuv   },
-            { pfYUV444P14, 0, make_black_background_planar_yuv16, make_frame_planar_yuv   },
-#endif
             { pfYUV420P16, 0, make_black_background_planar_yuv16, make_frame_planar_yuv   },
             { pfYUV422P16, 0, make_black_background_planar_yuv16, make_frame_planar_yuv   },
             { pfYUV444P16, 0, make_black_background_planar_yuv16, make_frame_planar_yuv   },
-            { pfGray8,     0, make_black_background_planar_gray,  make_frame_planar_gray  },
-            { pfGray16,    0, make_black_background_planar_gray,  make_frame_planar_gray  },
             { pfRGB24,     1, make_black_background_planar_rgb,   make_frame_planar_rgb   },
             { pfRGB27,     1, make_black_background_planar_rgb,   make_frame_planar_rgb   },
             { pfRGB30,     1, make_black_background_planar_rgb,   make_frame_planar_rgb   },
@@ -598,48 +432,21 @@ static int determine_colorspace_conversion
             { AV_PIX_FMT_YUV444P9BE,  pfYUV444P9,  1 },
             { AV_PIX_FMT_YUV420P10LE, pfYUV420P10, 0 },
             { AV_PIX_FMT_YUV420P10BE, pfYUV420P10, 1 },
-            { AV_PIX_FMT_P010LE,      pfYUV420P10, 1 },
-            { AV_PIX_FMT_P010BE,      pfYUV420P10, 1 },
             { AV_PIX_FMT_YUV422P10LE, pfYUV422P10, 0 },
             { AV_PIX_FMT_YUV422P10BE, pfYUV422P10, 1 },
             { AV_PIX_FMT_YUV444P10LE, pfYUV444P10, 0 },
             { AV_PIX_FMT_YUV444P10BE, pfYUV444P10, 1 },
-#if FFMPEG_HIGH_DEPTH_SUPPORT
-            { AV_PIX_FMT_YUV420P12LE, pfYUV420P12, 0 },
-            { AV_PIX_FMT_YUV420P12BE, pfYUV420P12, 1 },
-            { AV_PIX_FMT_YUV422P12LE, pfYUV422P12, 0 },
-            { AV_PIX_FMT_YUV422P12BE, pfYUV422P12, 1 },
-            { AV_PIX_FMT_YUV444P12LE, pfYUV444P12, 0 },
-            { AV_PIX_FMT_YUV444P12BE, pfYUV444P12, 1 },
-            { AV_PIX_FMT_YUV420P14LE, pfYUV420P14, 0 },
-            { AV_PIX_FMT_YUV420P14BE, pfYUV420P14, 1 },
-            { AV_PIX_FMT_YUV422P14LE, pfYUV422P14, 0 },
-            { AV_PIX_FMT_YUV422P14BE, pfYUV422P14, 1 },
-            { AV_PIX_FMT_YUV444P14LE, pfYUV444P14, 0 },
-            { AV_PIX_FMT_YUV444P14BE, pfYUV444P14, 1 },
-#endif
             { AV_PIX_FMT_YUV420P16LE, pfYUV420P16, 0 },
             { AV_PIX_FMT_YUV420P16BE, pfYUV420P16, 1 },
-            { AV_PIX_FMT_P016LE,      pfYUV420P16, 1 },
-            { AV_PIX_FMT_P016BE,      pfYUV420P16, 1 },
             { AV_PIX_FMT_YUV422P16LE, pfYUV422P16, 0 },
             { AV_PIX_FMT_YUV422P16BE, pfYUV422P16, 1 },
             { AV_PIX_FMT_YUV444P16LE, pfYUV444P16, 0 },
             { AV_PIX_FMT_YUV444P16BE, pfYUV444P16, 1 },
-            { AV_PIX_FMT_GRAY8,       pfGray8,     0 },
-#if FFMPEG_HIGH_DEPTH_SUPPORT
-            { AV_PIX_FMT_GRAY10LE,    pfGray16,    1 },
-            { AV_PIX_FMT_GRAY10BE,    pfGray16,    1 },
-#endif
-            { AV_PIX_FMT_GRAY12LE,    pfGray16,    1 },
-            { AV_PIX_FMT_GRAY12BE,    pfGray16,    1 },
-            { AV_PIX_FMT_GRAY16LE,    pfGray16,    0 },
-            { AV_PIX_FMT_GRAY16BE,    pfGray16,    1 },
             { AV_PIX_FMT_GBRP,        pfRGB24,     0 },
-            { AV_PIX_FMT_GBRP9LE,     pfRGB27,     0 },
-            { AV_PIX_FMT_GBRP9BE,     pfRGB27,     1 },
-            { AV_PIX_FMT_GBRP10LE,    pfRGB30,     0 },
-            { AV_PIX_FMT_GBRP10BE,    pfRGB30,     1 },
+            { AV_PIX_FMT_GBRP9LE,     pfRGB48,     0 },
+            { AV_PIX_FMT_GBRP9BE,     pfRGB48,     1 },
+            { AV_PIX_FMT_GBRP10LE,    pfRGB48,     0 },
+            { AV_PIX_FMT_GBRP10BE,    pfRGB48,     1 },
             { AV_PIX_FMT_GBRP16LE,    pfRGB48,     0 },
             { AV_PIX_FMT_GBRP16BE,    pfRGB48,     1 },
             { AV_PIX_FMT_BGR24,       pfRGB24,     0 },
@@ -679,8 +486,6 @@ static int determine_colorspace_conversion
     *output_pixel_format = fmt_conv_required
                          ? vs_to_av_output_pixel_format( vs_vohp->vs_output_pixel_format )
                          : input_pixel_format;
-    if( *output_pixel_format == AV_PIX_FMT_NONE )
-        return -1;
     vs_vohp->component_reorder = get_component_reorder( *output_pixel_format );
     int av_output_flags = av_pix_fmt_desc_get( *output_pixel_format )->flags;
     return set_frame_maker( vs_vohp, (av_output_flags & AV_PIX_FMT_FLAG_PLANAR) && (av_output_flags & AV_PIX_FMT_FLAG_RGB) );
@@ -706,7 +511,7 @@ static VSFrameRef *new_output_video_frame
     if( vs_vohp->variable_info )
     {
         if( !av_frame->opaque
-         && determine_colorspace_conversion( vs_vohp, (enum AVPixelFormat)av_frame->format, output_pixel_format ) < 0 )
+         && determine_colorspace_conversion( vs_vohp, av_frame->format, output_pixel_format ) < 0 )
             goto fail;
         const VSFormat *vs_format = vsapi->getFormatPreset( vs_vohp->vs_output_pixel_format, core );
         return vsapi->newVideoFrame( vs_format, av_frame->width, av_frame->height, NULL, core );
@@ -715,7 +520,7 @@ static VSFrameRef *new_output_video_frame
     {
         if( !av_frame->opaque
          && input_pix_fmt_change
-         && determine_colorspace_conversion( vs_vohp, (enum AVPixelFormat)av_frame->format, output_pixel_format ) < 0 )
+         && determine_colorspace_conversion( vs_vohp, av_frame->format, output_pixel_format ) < 0 )
             goto fail;
         return vsapi->copyFrame( vs_vohp->background_frame, core );
     }
@@ -779,23 +584,9 @@ static int vs_check_dr_available
             AV_PIX_FMT_YUV420P10LE,
             AV_PIX_FMT_YUV422P10LE,
             AV_PIX_FMT_YUV444P10LE,
-#if FFMPEG_HIGH_DEPTH_SUPPORT
-            AV_PIX_FMT_YUV420P12LE,
-            AV_PIX_FMT_YUV422P12LE,
-            AV_PIX_FMT_YUV444P12LE,
-            AV_PIX_FMT_YUV420P14LE,
-            AV_PIX_FMT_YUV422P14LE,
-            AV_PIX_FMT_YUV444P14LE,
-#endif
             AV_PIX_FMT_YUV420P16LE,
             AV_PIX_FMT_YUV422P16LE,
             AV_PIX_FMT_YUV444P16LE,
-            AV_PIX_FMT_GRAY8,
-#if FFMPEG_HIGH_DEPTH_SUPPORT
-            AV_PIX_FMT_GRAY10LE,
-#endif
-            AV_PIX_FMT_GRAY12LE,
-            AV_PIX_FMT_GRAY16LE,
             AV_PIX_FMT_GBRP,
             AV_PIX_FMT_GBRP9LE,
             AV_PIX_FMT_GBRP10LE,
@@ -873,14 +664,14 @@ static int vs_video_get_buffer
     av_frame->opaque = NULL;
     lw_video_output_handler_t *lw_vohp = (lw_video_output_handler_t *)ctx->opaque;
     vs_video_output_handler_t *vs_vohp = (vs_video_output_handler_t *)lw_vohp->private_handler;
-    enum AVPixelFormat pix_fmt = (enum AVPixelFormat)av_frame->format;
+    enum AVPixelFormat pix_fmt = av_frame->format;
     avoid_yuv_scale_conversion( &pix_fmt );
     av_frame->format = pix_fmt; /* Don't use AV_PIX_FMT_YUVJ*. */
     if( (!vs_vohp->variable_info && lw_vohp->scaler.output_pixel_format != pix_fmt)
      || !vs_check_dr_available( ctx, pix_fmt ) )
         return avcodec_default_get_buffer2( ctx, av_frame, flags );
     /* New VapourSynth video frame buffer. */
-    vs_video_buffer_handler_t *vs_vbhp = (vs_video_buffer_handler_t *)malloc( sizeof(vs_video_buffer_handler_t) );
+    vs_video_buffer_handler_t *vs_vbhp = malloc( sizeof(vs_video_buffer_handler_t) );
     if( !vs_vbhp )
     {
         av_frame_unref( av_frame );
@@ -992,7 +783,7 @@ vs_video_output_handler_t *vs_allocate_video_output_handler
     lw_video_output_handler_t *vohp
 )
 {
-    vs_video_output_handler_t *vs_vohp = (vs_video_output_handler_t *)lw_malloc_zero( sizeof(vs_video_output_handler_t) );
+    vs_video_output_handler_t *vs_vohp = lw_malloc_zero( sizeof(vs_video_output_handler_t) );
     if( !vs_vohp )
         return NULL;
     vohp->private_handler      = vs_vohp;
@@ -1003,7 +794,6 @@ vs_video_output_handler_t *vs_allocate_video_output_handler
 void vs_set_frame_properties
 (
     AVFrame        *av_frame,
-    AVStream       *stream,
     int64_t         duration_num,
     int64_t         duration_den,
     VSFrameRef     *vs_frame,
@@ -1039,86 +829,4 @@ void vs_set_frame_properties
     if( av_frame->interlaced_frame )
         field_based = av_frame->top_field_first ? 2 : 1;
     vsapi->propSetInt( props, "_FieldBased", field_based, paReplace );
-    /* Mastering display color volume */
-    int frame_has_primaries = 0, frame_has_luminance = 0;
-    const AVFrameSideData *mastering_display_side_data = av_frame_get_side_data( av_frame, AV_FRAME_DATA_MASTERING_DISPLAY_METADATA );
-    if( mastering_display_side_data )
-    {
-        const AVMasteringDisplayMetadata *mastering_display = (const AVMasteringDisplayMetadata *)mastering_display_side_data->data;
-        if( (frame_has_primaries = mastering_display->has_primaries) )
-        {
-            double display_primaries_x[3], display_primaries_y[3];
-            for( int i = 0; i < 3; i++ )
-            {
-                display_primaries_x[i] = av_q2d( mastering_display->display_primaries[i][0] );
-                display_primaries_y[i] = av_q2d( mastering_display->display_primaries[i][1] );
-            }
-            vsapi->propSetFloatArray( props, "MasteringDisplayPrimariesX", display_primaries_x, 3 );
-            vsapi->propSetFloatArray( props, "MasteringDisplayPrimariesY", display_primaries_y, 3 );
-            vsapi->propSetFloat( props, "MasteringDisplayWhitePointX", av_q2d( mastering_display->white_point[0] ), paReplace );
-            vsapi->propSetFloat( props, "MasteringDisplayWhitePointY", av_q2d( mastering_display->white_point[1] ), paReplace );
-        }
-        if( (frame_has_luminance = mastering_display->has_luminance) )
-        {
-            vsapi->propSetFloat( props, "MasteringDisplayMinLuminance", av_q2d( mastering_display->min_luminance ), paReplace );
-            vsapi->propSetFloat( props, "MasteringDisplayMaxLuminance", av_q2d( mastering_display->max_luminance ), paReplace );
-        }
-    }
-    if( stream && (!frame_has_primaries || !frame_has_luminance) )
-    {
-        for( int i = 0; i < stream->nb_side_data; i++ )
-        {
-            if( stream->side_data[i].type == AV_PKT_DATA_MASTERING_DISPLAY_METADATA )
-            {
-                const AVMasteringDisplayMetadata *mastering_display = (const AVMasteringDisplayMetadata *)stream->side_data[i].data;
-                if( mastering_display->has_primaries && !frame_has_primaries )
-                {
-                    double display_primaries_x[3], display_primaries_y[3];
-                    for( int i = 0; i < 3; i++ )
-                    {
-                        display_primaries_x[i] = av_q2d( mastering_display->display_primaries[i][0] );
-                        display_primaries_y[i] = av_q2d( mastering_display->display_primaries[i][1] );
-                    }
-                    vsapi->propSetFloatArray( props, "MasteringDisplayPrimariesX", display_primaries_x, 3 );
-                    vsapi->propSetFloatArray( props, "MasteringDisplayPrimariesY", display_primaries_y, 3 );
-                    vsapi->propSetFloat( props, "MasteringDisplayWhitePointX", av_q2d( mastering_display->white_point[0] ), paReplace );
-                    vsapi->propSetFloat( props, "MasteringDisplayWhitePointY", av_q2d( mastering_display->white_point[1] ), paReplace );
-                }
-                if( mastering_display->has_luminance && !frame_has_luminance )
-                {
-                    vsapi->propSetFloat( props, "MasteringDisplayMinLuminance", av_q2d( mastering_display->min_luminance ), paReplace );
-                    vsapi->propSetFloat( props, "MasteringDisplayMaxLuminance", av_q2d( mastering_display->max_luminance ), paReplace );
-                }
-                break;
-            }
-        }
-    }
-    /* Content light level */
-    int frame_has_light_level = 0;
-    const AVFrameSideData *content_light_side_data = av_frame_get_side_data( av_frame, AV_FRAME_DATA_CONTENT_LIGHT_LEVEL );
-    if( content_light_side_data )
-    {
-        const AVContentLightMetadata *content_light = (const AVContentLightMetadata *)content_light_side_data->data;
-        if( (frame_has_light_level = content_light->MaxCLL || content_light->MaxFALL) )
-        {
-            vsapi->propSetInt( props, "ContentLightLevelMax", content_light->MaxCLL, paReplace );
-            vsapi->propSetInt( props, "ContentLightLevelAverage", content_light->MaxFALL, paReplace );
-        }
-    }
-    if( stream && !frame_has_light_level )
-    {
-        for( int i = 0; i < stream->nb_side_data; i++ )
-        {
-            if( stream->side_data[i].type == AV_PKT_DATA_CONTENT_LIGHT_LEVEL )
-            {
-                const AVContentLightMetadata *content_light = (const AVContentLightMetadata *)stream->side_data[i].data;
-                if( content_light->MaxCLL || content_light->MaxFALL )
-                {
-                    vsapi->propSetInt( props, "ContentLightLevelMax", content_light->MaxCLL, paReplace );
-                    vsapi->propSetInt( props, "ContentLightLevelAverage", content_light->MaxFALL, paReplace );
-                }
-                break;
-            }
-        }
-    }
 }

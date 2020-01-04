@@ -30,27 +30,26 @@ static inline uint32_t get_decoder_delay
 
 const AVCodec *find_decoder
 (
-    enum AVCodecID     codec_id,
-    AVCodecParameters *codecpar,
-    const char       **preferred_decoder_names,
-    const int          prefer_hw_decoder
+    enum AVCodecID  codec_id,
+    const char    **preferred_decoder_names
 );
 
 int open_decoder
 (
-    AVCodecContext **ctx,
-    const AVStream  *stream,
-    const AVCodec   *codec,
-    const int        thread_count
+    AVCodecContext         **ctx,
+    const AVCodecParameters *codecpar,
+    const AVCodec           *codec,
+    const int                thread_count,
+    const int                refcounted_frames
 );
 
 int find_and_open_decoder
 (
-    AVCodecContext **ctx,
-    const AVStream  *stream,
-    const char     **preferred_decoder_names,
-    const int        prefer_hw_decoder,
-    const int        thread_count
+    AVCodecContext         **ctx,
+    const AVCodecParameters *codecpar,
+    const char             **preferred_decoder_names,
+    const int                thread_count,
+    const int                refcounted_frames
 );
 
 int decode_video_packet

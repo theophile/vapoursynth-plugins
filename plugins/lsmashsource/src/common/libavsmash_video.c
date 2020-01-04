@@ -167,15 +167,6 @@ void libavsmash_video_set_preferred_decoder_names
     vdhp->config.preferred_decoder_names = preferred_decoder_names;
 }
 
-void libavsmash_video_set_prefer_hw_decoder
-(
-    libavsmash_video_decode_handler_t *vdhp,
-    int                                prefer_hw_decoder
-)
-{
-    vdhp->config.prefer_hw_decoder = prefer_hw_decoder;
-}
-
 void libavsmash_video_set_log_handler
 (
     libavsmash_video_decode_handler_t *vdhp,
@@ -403,7 +394,8 @@ int libavsmash_video_initialize_decoder_configuration
         goto fail;
     }
     /* libavcodec */
-    if( libavsmash_find_and_open_decoder( &vdhp->config, format_ctx->streams[i], threads ) < 0 )
+    AVCodecParameters *codecpar = format_ctx->streams[i]->codecpar;
+    if( libavsmash_find_and_open_decoder( &vdhp->config, codecpar, threads, 1 ) < 0 )
     {
         strcpy( error_string, "Failed to find and open the video decoder.\n" );
         goto fail;
@@ -936,11 +928,10 @@ static uint32_t libavsmash_vfr2cfr
         if( target_pts == current_pts )
             return vdhp->last_sample_number;
     }
-    uint32_t composition_sample_number = vdhp->last_sample_number;
-    double   prev_pts = current_pts;
     if( target_pts < current_pts )
     {
-        for( composition_sample_number--;
+        uint32_t composition_sample_number;
+        for( composition_sample_number = vdhp->last_sample_number - 1;
              composition_sample_number;
              composition_sample_number-- )
         {
@@ -948,49 +939,35 @@ static uint32_t libavsmash_vfr2cfr
             if( lsmash_get_sample_info_from_media_timeline( vdhp->root, vdhp->track_id, decoding_sample_number, &sample ) < 0 )
                 return 0;
             current_pts = (double)(sample.cts - vdhp->min_cts) / vdhp->media_timescale;
-            prev_pts = current_pts;
             if( current_pts <= target_pts )
+            {
+                sample_number = composition_sample_number;
                 break;
+            }
         }
         if( composition_sample_number == 0 )
             return 0;
     }
-    double next_target_pts = (double)((uint64_t)sample_number * vohp->cfr_den) / vohp->cfr_num;
-    for( composition_sample_number++;
-         composition_sample_number <= vdhp->sample_count;
-         composition_sample_number++ )
+    else
     {
-        uint32_t decoding_sample_number = get_decoding_sample_number( vdhp->order_converter, composition_sample_number );
-        if( lsmash_get_sample_info_from_media_timeline( vdhp->root, vdhp->track_id, decoding_sample_number, &sample ) < 0 )
-            return 0;
-        current_pts = (double)(sample.cts - vdhp->min_cts) / vdhp->media_timescale;
-        if( current_pts >= target_pts )
+        uint32_t composition_sample_number;
+        for( composition_sample_number = vdhp->last_sample_number + 1;
+             composition_sample_number <= vdhp->sample_count;
+             composition_sample_number++ )
         {
-            uint32_t prev_composition_sample_number = composition_sample_number - 1;
-            if( current_pts > next_target_pts )
-                /* Between the current target and the next target, there are no input samples.
-                 * Therefore, output the previous sample. This is absolutely correct. */
-                sample_number = prev_composition_sample_number;
-            else
+            uint32_t decoding_sample_number = get_decoding_sample_number( vdhp->order_converter, composition_sample_number );
+            if( lsmash_get_sample_info_from_media_timeline( vdhp->root, vdhp->track_id, decoding_sample_number, &sample ) < 0 )
+                return 0;
+            current_pts = (double)(sample.cts - vdhp->min_cts) / vdhp->media_timescale;
+            if( current_pts > target_pts )
             {
-                if( current_pts > (next_target_pts + target_pts) / 2 )
-                    /* The current sample is far from the current target and should be a candidate for the next target. */
-                    sample_number = prev_composition_sample_number;
-                else
-                {
-                    /* Choose the nearest one. */
-                    if( current_pts - target_pts >= target_pts - prev_pts )
-                        sample_number = prev_composition_sample_number;
-                    else
-                        sample_number = composition_sample_number;
-                }
+                sample_number = composition_sample_number - 1;
+                break;
             }
-            break;
         }
-        prev_pts = current_pts;
+        if( composition_sample_number > vdhp->sample_count )
+            sample_number = vdhp->sample_count;
     }
-    if( composition_sample_number > vdhp->sample_count )
-        sample_number = vdhp->sample_count;
     return sample_number;
 }
 

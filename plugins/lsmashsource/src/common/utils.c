@@ -77,7 +77,7 @@ static void lw_log_write_message
     va_list           args
 )
 {
-    const char *prefix;
+    char *prefix;
     switch( level )
     {
         case LW_LOG_FATAL:

@@ -28,7 +28,7 @@ extern "C"
 #endif  /* __cplusplus */
 #include <libavformat/avformat.h>       /* Demuxer */
 #include <libavcodec/avcodec.h>         /* Decoder */
-#include <libswresample/swresample.h>   /* Resampler/Buffer */
+#include <libavresample/avresample.h>   /* Resampler/Buffer */
 #include <libavutil/mem.h>
 #include <libavutil/opt.h>
 #ifdef __cplusplus
@@ -201,8 +201,8 @@ int lwlibav_audio_get_desired_track
     if( adhp->stream_index < 0
      || adhp->frame_count == 0
      || lavf_open_file( &adhp->format, file_path, &adhp->lh ) < 0
-     || find_and_open_decoder( &ctx, adhp->format->streams[ adhp->stream_index ],
-                               adhp->preferred_decoder_names, 0, threads ) < 0 )
+     || find_and_open_decoder( &ctx, adhp->format->streams[ adhp->stream_index ]->codecpar,
+                               adhp->preferred_decoder_names, threads, 0 ) < 0 )
     {
         av_freep( &adhp->index_entries );
         lw_freep( &adhp->frame_list );
@@ -546,7 +546,7 @@ uint64_t lwlibav_audio_get_pcm_samples
 retry_seek:
         av_packet_unref( pkt );
         /* Flush audio resampler buffers. */
-        if( flush_resampler_buffers( aohp->swr_ctx ) < 0 )
+        if( flush_resampler_buffers( aohp->avr_ctx ) < 0 )
         {
             adhp->error = 1;
             lw_log_show( &adhp->lh, LW_LOG_FATAL,

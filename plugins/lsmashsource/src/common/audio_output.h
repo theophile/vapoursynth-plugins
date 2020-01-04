@@ -24,7 +24,7 @@
 
 typedef struct
 {
-    SwrContext *swr_ctx;
+    AVAudioResampleContext *avr_ctx;
     uint8_t                *resampled_buffer;
     int                     resampled_buffer_size;
     int                     input_planes;
