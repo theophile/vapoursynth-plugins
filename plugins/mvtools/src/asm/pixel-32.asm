@@ -398,7 +398,7 @@ cglobal pixel_ssim_4x4x2_core, 0,5
     add       r0, r1
     add       r2, r3
 %endrep
-    mov       r0, r4m
+    mov       r0d, r4m
     lea       r0, [r0+r4*4]
     pshufw    m5, m1, q0032
     pshufw    m6, m2, q0032
