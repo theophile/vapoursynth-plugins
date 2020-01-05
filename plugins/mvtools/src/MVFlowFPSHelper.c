@@ -65,21 +65,11 @@ const VSFrameRef *VS_CC mvflowfpshelperGetFrame(int n, int activationReason, voi
 
             // make  vector vx and vy small masks
             MakeVectorSmallMasks(&fgop, nBlkX, nBlkY, VXSmallY, nBlkXP, VYSmallY, nBlkXP);
-            if (nBlkXP > nBlkX) { // fill right
-                for (int j = 0; j < nBlkY; j++) {
-                    VXSmallY[j * nBlkXP + nBlkX] = VSMIN(VXSmallY[j * nBlkXP + nBlkX - 1], 0);
-                    VYSmallY[j * nBlkXP + nBlkX] = VYSmallY[j * nBlkXP + nBlkX - 1];
-                }
-            }
-            if (nBlkYP > nBlkY) { // fill bottom
-                for (int i = 0; i < nBlkXP; i++) {
-                    VXSmallY[nBlkXP * nBlkY + i] = VXSmallY[nBlkXP * (nBlkY - 1) + i];
-                    VYSmallY[nBlkXP * nBlkY + i] = VSMIN(VYSmallY[nBlkXP * (nBlkY - 1) + i], 0);
-                }
-            }
 
-            upsizer->simpleResize_int16_t(upsizer, VXFullY, VPitchY, VXSmallY, nBlkXP);
-            upsizer->simpleResize_int16_t(upsizer, VYFullY, VPitchY, VYSmallY, nBlkXP);
+            CheckAndPadSmallY(VXSmallY, VYSmallY, nBlkXP, nBlkYP, nBlkX, nBlkY);
+
+            upsizer->simpleResize_int16_t(upsizer, VXFullY, VPitchY, VXSmallY, nBlkXP, 1);
+            upsizer->simpleResize_int16_t(upsizer, VYFullY, VPitchY, VYSmallY, nBlkXP, 0);
 
             vsapi->propSetData(props, prop_VXFullY, (const char *)VXFullY, full_size_y, paReplace);
             vsapi->propSetData(props, prop_VYFullY, (const char *)VYFullY, full_size_y, paReplace);
@@ -98,8 +88,8 @@ const VSFrameRef *VS_CC mvflowfpshelperGetFrame(int n, int activationReason, voi
                 VectorSmallMaskYToHalfUV(VXSmallY, nBlkXP, nBlkYP, VXSmallUV, xRatioUV);
                 VectorSmallMaskYToHalfUV(VYSmallY, nBlkXP, nBlkYP, VYSmallUV, yRatioUV);
 
-                upsizerUV->simpleResize_int16_t(upsizerUV, VXFullUV, VPitchUV, VXSmallUV, nBlkXP);
-                upsizerUV->simpleResize_int16_t(upsizerUV, VYFullUV, VPitchUV, VYSmallUV, nBlkXP);
+                upsizerUV->simpleResize_int16_t(upsizerUV, VXFullUV, VPitchUV, VXSmallUV, nBlkXP, 1);
+                upsizerUV->simpleResize_int16_t(upsizerUV, VYFullUV, VPitchUV, VYSmallUV, nBlkXP, 0);
 
                 free(VXSmallUV);
                 free(VYSmallUV);

@@ -17,7 +17,7 @@
 // Foundation, Inc., 675 Mass Ave, Cambridge, MA 02139, USA, or visit
 // http://www.gnu.org/copyleft/gpl.html .
 
-
+#include <limits.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
@@ -266,18 +266,7 @@ static const VSFrameRef *VS_CC mvflowGetFrame(int n, int activationReason, void 
 
             MakeVectorSmallMasks(&fgop, nBlkX, nBlkY, VXSmallY, nBlkXP, VYSmallY, nBlkXP);
 
-            if (nBlkXP > nBlkX) { // fill right
-                for (int j = 0; j < nBlkY; j++) {
-                    VXSmallY[j * nBlkXP + nBlkX] = VSMIN(VXSmallY[j * nBlkXP + nBlkX - 1], 0);
-                    VYSmallY[j * nBlkXP + nBlkX] = VYSmallY[j * nBlkXP + nBlkX - 1];
-                }
-            }
-            if (nBlkYP > nBlkY) { // fill bottom
-                for (int i = 0; i < nBlkXP; i++) {
-                    VXSmallY[nBlkXP * nBlkY + i] = VXSmallY[nBlkXP * (nBlkY - 1) + i];
-                    VYSmallY[nBlkXP * nBlkY + i] = VSMIN(VYSmallY[nBlkXP * (nBlkY - 1) + i], 0);
-                }
-            }
+            CheckAndPadSmallY(VXSmallY, VYSmallY, nBlkXP, nBlkYP, nBlkX, nBlkY);
 
             int fieldShift = 0;
             if (d->fields && nPel > 1 && ((nref - n) % 2 != 0)) {
@@ -320,8 +309,8 @@ static const VSFrameRef *VS_CC mvflowGetFrame(int n, int activationReason, void 
                 }
             }
 
-            d->upsizer.simpleResize_int16_t(&d->upsizer, VXFullY, VPitchY, VXSmallY, nBlkXP);
-            d->upsizer.simpleResize_int16_t(&d->upsizer, VYFullY, VPitchY, VYSmallY, nBlkXP);
+            d->upsizer.simpleResize_int16_t(&d->upsizer, VXFullY, VPitchY, VXSmallY, nBlkXP, 1);
+            d->upsizer.simpleResize_int16_t(&d->upsizer, VYFullY, VPitchY, VYSmallY, nBlkXP, 0);
 
             int nOffsetY = nRefPitches[0] * nVPadding * nPel + nHPadding * bytesPerSample * nPel;
             int nOffsetUV = nRefPitches[1] * nVPaddingUV * nPel + nHPaddingUV * bytesPerSample * nPel;
@@ -346,8 +335,8 @@ static const VSFrameRef *VS_CC mvflowGetFrame(int n, int activationReason, void 
                 VectorSmallMaskYToHalfUV(VXSmallY, nBlkXP, nBlkYP, VXSmallUV, xRatioUV);
                 VectorSmallMaskYToHalfUV(VYSmallY, nBlkXP, nBlkYP, VYSmallUV, yRatioUV);
 
-                d->upsizerUV.simpleResize_int16_t(&d->upsizerUV, VXFullUV, VPitchUV, VXSmallUV, nBlkXP);
-                d->upsizerUV.simpleResize_int16_t(&d->upsizerUV, VYFullUV, VPitchUV, VYSmallUV, nBlkXP);
+                d->upsizerUV.simpleResize_int16_t(&d->upsizerUV, VXFullUV, VPitchUV, VXSmallUV, nBlkXP, 1);
+                d->upsizerUV.simpleResize_int16_t(&d->upsizerUV, VYFullUV, VPitchUV, VYSmallUV, nBlkXP, 0);
 
 
                 if (d->mode == Shift) {
@@ -432,7 +421,7 @@ static void VS_CC mvflowCreate(const VSMap *in, VSMap *out, void *userData, VSCo
 
     d.opt = !!vsapi->propGetInt(in, "opt", 0, &err);
     if (err)
-        d.opt = 1;
+        d.opt = INT_MAX;
 
     d.tff = !!vsapi->propGetInt(in, "tff", 0, &err);
     d.tff_exists = !err;
@@ -570,9 +559,13 @@ static void VS_CC mvflowCreate(const VSMap *in, VSMap *out, void *userData, VSCo
         return;
     }
 
+    d.nBlkXP = d.vectors_data.nBlkX;
+    d.nBlkYP = d.vectors_data.nBlkY;
+    while (d.nBlkXP * (d.vectors_data.nBlkSizeX - d.vectors_data.nOverlapX) + d.vectors_data.nOverlapX < d.vectors_data.nWidth)
+        d.nBlkXP++;
+    while (d.nBlkYP * (d.vectors_data.nBlkSizeY - d.vectors_data.nOverlapY) + d.vectors_data.nOverlapY < d.vectors_data.nHeight)
+        d.nBlkYP++;
 
-    d.nBlkXP = (d.vectors_data.nBlkX * (d.vectors_data.nBlkSizeX - d.vectors_data.nOverlapX) + d.vectors_data.nOverlapX < d.vectors_data.nWidth) ? d.vectors_data.nBlkX + 1 : d.vectors_data.nBlkX;
-    d.nBlkYP = (d.vectors_data.nBlkY * (d.vectors_data.nBlkSizeY - d.vectors_data.nOverlapY) + d.vectors_data.nOverlapY < d.vectors_data.nHeight) ? d.vectors_data.nBlkY + 1 : d.vectors_data.nBlkY;
     d.nWidthP = d.nBlkXP * (d.vectors_data.nBlkSizeX - d.vectors_data.nOverlapX) + d.vectors_data.nOverlapX; /// can be a local
     d.nHeightP = d.nBlkYP * (d.vectors_data.nBlkSizeY - d.vectors_data.nOverlapY) + d.vectors_data.nOverlapY;
 
@@ -591,9 +584,9 @@ static void VS_CC mvflowCreate(const VSMap *in, VSMap *out, void *userData, VSCo
     d.pixel_max = (1 << d.vi->format->bitsPerSample) - 1;
 
 
-    simpleInit(&d.upsizer, d.nWidthP, d.nHeightP, d.nBlkXP, d.nBlkYP, d.opt);
+    simpleInit(&d.upsizer, d.nWidthP, d.nHeightP, d.nBlkXP, d.nBlkYP, d.vectors_data.nWidth, d.vectors_data.nHeight, d.vectors_data.nPel, d.opt);
     if (d.vi->format->colorFamily != cmGray)
-        simpleInit(&d.upsizerUV, d.nWidthPUV, d.nHeightPUV, d.nBlkXP, d.nBlkYP, d.opt);
+        simpleInit(&d.upsizerUV, d.nWidthPUV, d.nHeightPUV, d.nBlkXP, d.nBlkYP, d.nWidthUV, d.nHeightUV, d.vectors_data.nPel, d.opt);
 
 
     if (d.vi->format->bitsPerSample == 8) {

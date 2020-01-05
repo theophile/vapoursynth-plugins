@@ -154,11 +154,11 @@ static void VS_CC mvsuperCreate(const VSMap *in, VSMap *out, void *userData, VSC
 
     d.nHPad = int64ToIntS(vsapi->propGetInt(in, "hpad", 0, &err));
     if (err)
-        d.nHPad = 8;
+        d.nHPad = 16;
 
     d.nVPad = int64ToIntS(vsapi->propGetInt(in, "vpad", 0, &err));
     if (err)
-        d.nVPad = 8;
+        d.nVPad = 16;
 
     d.nPel = int64ToIntS(vsapi->propGetInt(in, "pel", 0, &err));
     if (err)
@@ -180,7 +180,7 @@ static void VS_CC mvsuperCreate(const VSMap *in, VSMap *out, void *userData, VSC
 
     d.opt = !!vsapi->propGetInt(in, "opt", 0, &err);
     if (err)
-        d.opt = 1;
+        d.opt = INT_MAX;
 
 
     if ((d.nPel != 1) && (d.nPel != 2) && (d.nPel != 4)) {

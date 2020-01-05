@@ -45,12 +45,22 @@ extern "C" {
 #define X264_CPU_SLOW_PALIGNR    0x4000000  /* such as on the AMD Bobcat */
 
 void mvtools_cpu_emms();
-uint32_t mvtools_cpu_cpuid(uint32_t op, uint32_t *eax, uint32_t *ebx, uint32_t *ecx, uint32_t *edx);
-void mvtools_cpu_xgetbv(uint32_t op, uint32_t *eax, uint32_t *edx);
+void mvtools_cpu_cpuid(uint32_t op, uint32_t *eax, uint32_t *ebx, uint32_t *ecx, uint32_t *edx);
+uint64_t mvtools_cpu_xgetbv(int xcr);
 
 #endif // MVTOOLS_X86
 
 uint32_t cpu_detect(void);
+
+enum {
+    MVOPT_SCALAR = 0,
+#ifdef MVTOOLS_X86
+    MVOPT_SSE2 = 1,
+    MVOPT_AVX2 = 2,
+#endif // MVTOOLS_X86
+};
+
+extern uint32_t g_cpuinfo;
 
 #ifdef __cplusplus
 } // extern "C"
