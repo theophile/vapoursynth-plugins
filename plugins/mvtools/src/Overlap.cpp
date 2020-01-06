@@ -18,10 +18,8 @@
 
 #include <cmath>
 #include <cstdlib>
-#include <stdexcept>
 #include <unordered_map>
 
-#include "CPU.h"
 #include "Overlap.h"
 
 #ifndef M_PI
@@ -168,7 +166,6 @@ void overlaps_c(uint8_t *pDst8, intptr_t nDstPitch, const uint8_t *pSrc8, intptr
 
 template <unsigned blockWidth, unsigned blockHeight>
 struct OverlapsWrapper {
-    static_assert(blockWidth >= 8, "");
 
     static void overlaps_sse2(uint8_t *pDst8, intptr_t nDstPitch, const uint8_t *pSrc, intptr_t nSrcPitch, int16_t *pWin, intptr_t nWinPitch) {
         /* pWin from 0 to 2048 */
@@ -233,19 +230,25 @@ struct OverlapsWrapper<4, blockHeight> {
 #endif
 
 
+enum InstructionSets {
+    Scalar,
+    SSE2,
+};
+
+
 // opt can fit in four bits, if the width and height need more than eight bits each.
 #define KEY(width, height, bits, opt) (unsigned)(width) << 24 | (height) << 16 | (bits) << 8 | (opt)
 
 #if defined(MVTOOLS_X86)
 #define OVERS_SSE2(width, height) \
-    { KEY(width, height, 8, MVOPT_SSE2), OverlapsWrapper<width, height>::overlaps_sse2 },
+    { KEY(width, height, 8, SSE2), OverlapsWrapper<width, height>::overlaps_sse2 },
 #else
 #define OVERS_SSE2(width, height)
 #endif
 
 #define OVERS(width, height) \
-    { KEY(width, height, 8, MVOPT_SCALAR), overlaps_c<width, height, uint16_t, uint8_t> }, \
-    { KEY(width, height, 16, MVOPT_SCALAR), overlaps_c<width, height, uint32_t, uint16_t> },
+    { KEY(width, height, 8, Scalar), overlaps_c<width, height, uint16_t, uint8_t> }, \
+    { KEY(width, height, 16, Scalar), overlaps_c<width, height, uint32_t, uint16_t> },
 
 static const std::unordered_map<uint32_t, OverlapsFunction> overlaps_functions = {
     OVERS(2, 2)
@@ -303,19 +306,13 @@ static const std::unordered_map<uint32_t, OverlapsFunction> overlaps_functions =
 };
 
 OverlapsFunction selectOverlapsFunction(unsigned width, unsigned height, unsigned bits, int opt) {
-    OverlapsFunction overs = overlaps_functions.at(KEY(width, height, bits, MVOPT_SCALAR));
+    OverlapsFunction overs = overlaps_functions.at(KEY(width, height, bits, Scalar));
 
 #if defined(MVTOOLS_X86)
     if (opt) {
         try {
-            overs = overlaps_functions.at(KEY(width, height, bits, MVOPT_SSE2));
+            overs = overlaps_functions.at(KEY(width, height, bits, SSE2));
         } catch (std::out_of_range &) { }
-    }
-
-    if (opt >= MVOPT_AVX2 && (g_cpuinfo & X264_CPU_AVX2)) {
-        OverlapsFunction tmp = selectOverlapsFunctionAVX2(width, height, bits);
-        if (tmp)
-            overs = tmp;
     }
 #endif
 
