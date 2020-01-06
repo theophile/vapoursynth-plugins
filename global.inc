@@ -1,7 +1,6 @@
 include ../../config.mak
 
 YASM   := yasm
-NASM   := nasm
 ASMINC := -I.
 
 ifneq ($(V),1)
@@ -11,17 +10,12 @@ CXX_silent    = @ echo '  CXX      '$@;
 CCLD_silent   = @ echo '  CCLD     '$@;
 CC_silent     = @ echo '  CC       '$@;
 YASM_silent   = @ echo '  YASM     '$@;
-NASM_silent   = @ echo '  NASM     '$@;
 AR_silent     = @ echo '  AR       '$@;
 RANLIB_silent = @ echo '  RANLIB   '$@;
 endif
 
 define asmcompile
 	$(YASM_silent)$(YASM) $(VSASFLAGS) $(ASMINC) $(ASFLAGS) -o $@ $<
-endef
-
-define nasmcompile
-        $(NASM_silent)$(NASM) $(VSASFLAGS) $(ASMINC) $(ASFLAGS) -o $@ $<
 endef
 
 ifneq ($(LIBNAME),)
